@@ -1,0 +1,117 @@
+# Loopback-only recipe with public, disposable test credentials. Never deploy it.
+name: planning-idel
+
+x-local-jwt: &local-jwt planning-idel-loopback-test-only-signing-secret-v1
+x-local-origin: &local-origin http://127.0.0.1:5173
+
+services:
+  db:
+    image: supabase/postgres:17.6.1.136
+    environment:
+      POSTGRES_PASSWORD: idel_local_only
+      POSTGRES_DB: postgres
+    volumes:
+      - database:/var/lib/postgresql/data
+      - ./docker/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-idel-roles.sql:ro
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  auth:
+    image: supabase/gotrue:v2.198.0
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      API_EXTERNAL_URL: http://127.0.0.1:5173/auth/v1
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:idel_local_only@db:5432/postgres
+      GOTRUE_SITE_URL: *local-origin
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_PASSWORD_MIN_LENGTH: 14
+      GOTRUE_JWT_SECRET: *local-jwt
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_MFA_TOTP_ENROLL_ENABLED: "true"
+      GOTRUE_MFA_TOTP_VERIFY_ENABLED: "true"
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:9999/health]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  migrate:
+    image: supabase/postgres:17.6.1.136
+    entrypoint: [sh, /local/migrate.sh]
+    depends_on:
+      auth: { condition: service_healthy }
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGPASSWORD: idel_local_only
+    volumes:
+      - ./docker/migrate.sh:/local/migrate.sh:ro
+      - ./supabase/migrations:/migrations:ro
+
+  rest:
+    image: postgrest/postgrest:v14.18
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    environment:
+      PGRST_DB_URI: postgres://authenticator:idel_local_only@db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_JWT_SECRET: *local-jwt
+      PGRST_ADMIN_SERVER_PORT: 3001
+      PGRST_ADMIN_SERVER_HOST: localhost
+    healthcheck:
+      test: [CMD, postgrest, --ready]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        VITE_SUPABASE_URL: *local-origin
+        VITE_SUPABASE_PUBLISHABLE_KEY: &local-anon eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InBsYW5uaW5nLWlkZWwtbG9jYWwifQ.IJf_6tfrR9osxq637hsSmLOYtMsyhXOVCfbORUlHYME
+    depends_on:
+      auth: { condition: service_healthy }
+      rest: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:5173:80"
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1/]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  fixtures:
+    image: node:22.17.0-alpine
+    profiles: [fixtures]
+    depends_on:
+      web: { condition: service_healthy }
+    environment:
+      IDEL_LOCAL_JWT_SECRET: *local-jwt
+      IDEL_LOCAL_ANON_KEY: *local-anon
+    working_dir: /fixture
+    volumes:
+      - ./docker/fixtures.mjs:/fixture/fixtures.mjs:ro
+      - ./scripts/planning.mjs:/fixture/planning.mjs:ro
+    entrypoint: [node, fixtures.mjs]
+    command: [seed]
+
+volumes:
+  database:
