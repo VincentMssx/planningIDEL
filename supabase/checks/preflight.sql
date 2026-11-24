@@ -15,15 +15,27 @@ select * from (values
     and to_regprocedure('public.save_colleague_contacts(text,text,text)') is null),
   ('Operator provisioning not granted to clients', not has_function_privilege('authenticated','public.provision_operator(uuid)','EXECUTE')
     and not has_function_privilege('anon','public.provision_operator(uuid)','EXECUTE')),
+  ('TOTP pairing restricted to the project owner or service role',
+    not has_function_privilege('authenticated','public.approve_operator_totp(uuid,uuid)','EXECUTE')
+    and not has_function_privilege('anon','public.approve_operator_totp(uuid,uuid)','EXECUTE')),
+  ('Chat API unavailable', to_regprocedure('public.post_message(text)') is null
+    and not has_table_privilege('authenticated','public.messages','SELECT')
+    and not has_table_privilege('anon','public.messages','SELECT')),
+  ('No legacy free text stored in this hosted project', not exists (select 1 from public.messages)
+    and not exists (select 1 from idel_private.retired_audit_reasons)
+    and not exists (select 1 from public.audit where details ? 'reason')),
   ('HTTP and pgcrypto installed in extensions', (select count(*) = 2 from pg_extension
     where extname in ('http','pgcrypto') and extnamespace = 'extensions'::regnamespace)),
-  ('Production sender and Resend key configured', (select count(distinct name) = 2 from vault.decrypted_secrets
-    where name in ('idel_email_sender','idel_resend_api_key') and nullif(btrim(decrypted_secret),'') is not null)),
-  ('No local mail transport', not exists (select 1 from vault.decrypted_secrets where name = 'idel_email_transport' and decrypted_secret = 'mailpit')),
+  ('Email challenge RPCs retired', to_regprocedure('public.request_email_code()') is null
+    and to_regprocedure('public.verify_email_code(text)') is null),
   ('Four confirmed IDEL accounts linked', (select count(*) = 4 from public.members m join auth.users u on u.id = m.id
     join idel_private.credentials c on c.member_id = u.id and c.verified_email = u.email where u.email_confirmed_at is not null)),
   ('Active separate operator provisioned', exists (select 1 from idel_private.operators o join auth.users u on u.id = o.id
     join idel_private.credentials c on c.member_id = u.id and c.verified_email = u.email
     where o.active and u.email_confirmed_at is not null and not exists (select 1 from public.members m where m.id = o.id))),
+  ('Active operators have a verified TOTP factor approved', exists (select 1 from idel_private.operators where active)
+    and not exists (select 1 from idel_private.operators o where o.active and not exists (
+      select 1 from auth.mfa_factors f where f.id = o.totp_factor_id and f.user_id = o.id
+        and f.factor_type = 'totp' and f.status = 'verified'))),
   ('Semester imported', (select count(*) = 362 from public.assignments) and exists (select 1 from public.audit where kind = 'import'))
 ) as checks(check_name, passed);

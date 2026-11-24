@@ -18,10 +18,20 @@ for (const [label, input, pattern] of [
   ['hors semestre', `${csv}\n2027-07-01,L,Lu`, /hors semestre/],
   ['date impossible', `${csv}\n2027-02-29,L,Lu`, /date invalide/],
   ['code ambigu', csv.replace(first, `${days[0]},L,?`), /Ligne 2.*codes attendus/],
-  ['case vide', csv.replace(first, `${days[0]},L,`), /aucune case vide/],
+  ['colonne manquante', csv.replace(first, `${days[0]},L`), /trois colonnes/],
   ['colonne surnuméraire', csv.replace(first, `${first},F`), /trois colonnes/],
   ['même personne', csv.replace(first, `${days[0]},L,L`), /même personne/],
 ]) test(label, () => assert.match(validate(input).errors.join('\n'), pattern))
+
+for (const [fields, expected] of [['L,', ['Linda', null]], [',Lu', [null, 'Lucie']], [',', [null, null]]]) {
+  test(`créneaux à définir : ${fields}`, () => {
+    const result = validate(csv.replace(first, `${days[0]},${fields}`))
+    assert.deepEqual(result.errors, [])
+    assert.deepEqual(result.exceptions, [])
+    assert.equal(result.rows.length, 362)
+    assert.deepEqual(result.rows.slice(0, 2).map((r) => r.name), expected)
+  })
+}
 
 test('une exception est signalée et conservée', () => {
   const result = validate(csv.replace(first, `${days[0]},F,Lu`))

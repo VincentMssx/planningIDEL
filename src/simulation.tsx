@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { dayKey, effectiveStatus, PAGE_SIZE, PEOPLE, type Audit, type Message, type Snapshot, type Line } from './data'
+import { assigned, dayKey, effectiveStatus, isRefusalReason, PAGE_SIZE, PEOPLE, type Audit, type Snapshot, type Line } from './data'
 import { WorkspaceView, type WorkspaceSource } from './workspace'
 
 const today = '2026-12-31'
@@ -14,16 +14,13 @@ function createScenario() {
     members: PEOPLE.map(({ name }) => ({ id: name, name, active: true })),
     assignments: Array.from({ length: 181 }, (_, i) => {
       const day = dayKey(0, i + 1)
-      return ([1, 2] as const).map((tour) => ({ day, tour, member_id: (tour === 1 ? (i % 2 ? PEOPLE[1] : PEOPLE[0]) : (i % 2 ? PEOPLE[3] : PEOPLE[2])).name, version: 1 }))
+      return ([1, 2] as const).map((tour) => ({ day, tour, member_id: i === 4 ? null : (tour === 1 ? (i % 2 ? PEOPLE[1] : PEOPLE[0]) : (i % 2 ? PEOPLE[3] : PEOPLE[2])).name, version: 1 }))
     }).flat(),
     proposals: [{ id: initialId, author_id: 'Linda', status: 'pending', created_at: stamp, expires_on: '2027-01-01' }],
     lines: [{ proposal_id: initialId, day: '2027-01-01', tour: 1, before_id: 'Linda', after_id: 'Julie', before_version: 1 }],
     votes: [],
   }
   const audit: Audit[] = [{ id: 'demo-audit', kind: 'proposal', actor_id: 'Linda', proposal_id: initialId, days: ['2027-01-01'], details: { lines: snapshot.lines.slice() }, created_at: stamp }]
-  const messages: Message[] = [
-    { id: 'demo-message', member_id: 'Lucie', body: 'Bienvenue dans le planning de démonstration.', created_at: stamp, proposal_id: null, proposal_day: null },
-  ]
   let scenarioTime = Date.parse(stamp)
 
   function groupedHistory() {
@@ -46,9 +43,9 @@ function createScenario() {
       today: () => today,
       allowed: async () => PEOPLE.some((p) => p.name === actor),
       snapshot: async () => structuredClone(snapshot),
-      async feed(table, day, cursor, history = 'all') {
-        const rows = (table === 'messages' ? messages.slice().sort(newestFirst) : groupedHistory()
-          .filter((entry) => (!day || entry.days.includes(day)) && (history === 'all' || entry.kind === history)))
+      async history(day, cursor, history = 'all') {
+        const rows = groupedHistory()
+          .filter((entry) => (!day || entry.days.includes(day)) && (history === 'all' || entry.kind === history))
           .filter((row) => !cursor || newestFirst(row, cursor) > 0)
         return { rows: structuredClone(rows.slice(0, PAGE_SIZE)), more: rows.length > PAGE_SIZE }
       },
@@ -62,10 +59,13 @@ function createScenario() {
         const log = (kind: string, id: string, lines: Line[], details: Audit['details'] = { lines }) => audit.push({
           id: crypto.randomUUID(), kind, actor_id: actor, proposal_id: id, days: [...new Set(lines.map((line) => line.day))], details, created_at: now,
         })
-        if (name === 'post_message') {
-          const body = String(args.p_body ?? '').trim()
-          if (!body || body.length > 2000) return invalid('Le message doit contenir de 1 à 2 000 caractères.')
-          messages.push({ id: crypto.randomUUID(), member_id: actor, body, created_at: now, proposal_id: null, proposal_day: null })
+        if (name === 'claim_unassigned_slot') {
+          const a = snapshot.assignments.find((a) => a.day === args.p_day && a.tour === args.p_tour)
+          if (!a || a.member_id !== null || a.day <= today || !PEOPLE.some((m) => m.name === actor && m.tour === a.tour) ||
+            snapshot.assignments.some((other) => other.day === a.day && other.member_id === actor)) return invalid('Créneau indisponible.')
+          a.member_id = actor
+          a.version++
+          audit.push({ id: crypto.randomUUID(), kind: 'claim', actor_id: actor, proposal_id: null, days: [a.day], details: { tour: a.tour }, created_at: now })
         } else if (name === 'create_proposal') {
           const tour = args.p_tour
           const day = args.p_day
@@ -75,12 +75,12 @@ function createScenario() {
           const first = snapshot.assignments.find((a) => a.day === day && a.tour === tour)
           const second = snapshot.assignments.find((a) => a.day === swap && a.tour === tour)
           const target = second?.member_id ?? args.p_after_id
-          if (!first || first.day <= today || (swap != null && (!second || second.day <= today || second.day === first.day || !pair.includes(first.member_id))) ||
+          if (!assigned(first) || first.day <= today || (swap != null && (!assigned(second) || second.day <= today || second.day === first.day || !pair.includes(first.member_id))) ||
             typeof target !== 'string' || !pair.includes(target) || first.member_id === target) return invalid('Tournée, date ou collègue incompatible.')
           const id = crypto.randomUUID()
           const line = (a: typeof first, after_id: string): Line => ({ proposal_id: id, day: a.day, tour: a.tour, before_id: a.member_id, before_version: a.version, after_id })
           const lines = [line(first, target)]
-          if (second) lines.push(line(second, first.member_id))
+          if (assigned(second)) lines.push(line(second, first.member_id))
           lines.sort((a, b) => a.day.localeCompare(b.day) || a.tour - b.tour)
           if (lines.some((candidate) => snapshot.lines.some((l) => l.day === candidate.day && l.tour === candidate.tour &&
             snapshot.proposals.some((p) => p.id === l.proposal_id && effectiveStatus(p, today) === 'pending')))) return invalid('Une demande existe déjà pour ce créneau.')
@@ -93,7 +93,7 @@ function createScenario() {
           const p = snapshot.proposals.find((proposal) => proposal.id === args.p_proposal_id)
           if (!p) return invalid('Demande inconnue.')
           const lines = snapshot.lines.filter((l) => l.proposal_id === p.id)
-          let refusalDetails: { lines: Line[]; reason: string } | undefined
+          let refusalDetails: Audit['details'] | undefined
           if (name === 'withdraw_proposal') {
             if (p.author_id !== actor) return forbidden('Seul l’auteur peut retirer la demande.')
             if (effectiveStatus(p, today) !== 'pending') return invalid('Cette demande est fermée ou expirée.')
@@ -105,21 +105,16 @@ function createScenario() {
             if (!voters.has(actor)) return forbidden('Seules les deux personnes concernées peuvent voter.')
             if (voters.size !== 2) return invalid('La demande doit concerner exactement deux personnes.')
             if (effectiveStatus(p, today) === 'expired') return invalid('Cette demande est expirée.')
-            const reason = typeof args.p_reason === 'string' ? args.p_reason.trim() : ''
-            if (!approve && (!reason || [...reason].length > 500)) return invalid('Le motif du refus doit contenir de 1 à 500 caractères.')
+            const reasonCode = args.p_reason
+            if (!approve && !isRefusalReason(reasonCode)) return invalid('Choisissez un motif de refus valide.')
             const previous = snapshot.votes.find((vote) => vote.proposal_id === p.id && vote.member_id === actor)
             if (previous) return previous.approve === approve ? ok : invalid('Un vote ne peut pas être modifié.')
             if (p.status !== 'pending') return invalid('Cette demande est déjà fermée.')
             snapshot.votes.push({ proposal_id: p.id, member_id: actor, approve, created_at: now })
-            log('vote', p.id, lines, approve ? { approve } : { approve, reason })
+            log('vote', p.id, lines, approve ? { approve } : { approve, reason_code: reasonCode })
             if (!approve) {
               p.status = 'rejected'
-              refusalDetails = { lines, reason }
-              const slots = lines.map((l) => `${l.day.split('-').reverse().join('/')} (Tournée ${l.tour}) : ${l.before_id} → ${l.after_id}`).join('\n')
-              messages.push({
-                id: crypto.randomUUID(), member_id: actor, created_at: now, proposal_id: p.id, proposal_day: p.expires_on,
-                body: `Demande refusée · ${lines.length === 1 ? 'Remplacement' : 'Échange'}\nProposition de ${p.author_id}\n${slots}\nMotif : ${reason}`,
-              })
+              refusalDetails = { lines, reason_code: reasonCode }
             } else if ([...voters].every((id) => snapshot.votes.some((v) => v.proposal_id === p.id && v.member_id === id && v.approve))) {
               const slots = lines.map((l) => snapshot.assignments.find((a) => a.day === l.day && a.tour === l.tour))
               if (lines.some((l, i) => slots[i]?.version !== l.before_version || slots[i]?.member_id !== l.before_id ||

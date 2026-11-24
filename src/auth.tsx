@@ -49,15 +49,15 @@ function Login({ db }: { db: Client }) {
   </Panel>
 }
 
-type Phase = 'loading' | 'denied' | 'password' | 'email' | 'ready' | 'admin' | 'unavailable'
+type Phase = 'loading' | 'denied' | 'password' | 'mfa' | 'reauth' | 'ready' | 'admin' | 'unavailable'
 
 function Gate({ db, session }: { db: Client; session: Session }) {
   const [phase, setPhase] = useState<Phase>('loading')
   const [retry, setRetry] = useState(0)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [mailStatus, setMailStatus] = useState('')
   const [signedOut, setSignedOut] = useState(false)
+  const [operatorFactorId, setOperatorFactorId] = useState<string | null>(null)
   const gated = useRef(false)
   const id = session.user.id
   const token = session.access_token
@@ -72,13 +72,15 @@ function Gate({ db, session }: { db: Client; session: Session }) {
         if (account.must_change_password) { gated.current = false; setPhase('password'); return }
         if (account.operator) {
           gated.current = false
-          setPhase(account.verified ? 'admin' : 'email')
+          if (account.operator_factor_id === undefined) { setPhase('unavailable'); return }
+          setOperatorFactorId(account.operator_factor_id)
+          setPhase(!account.operator_session_fresh ? 'reauth' : account.verified && account.operator_factor_id ? 'admin' : 'mfa')
           return
         }
         const allowed = await canReadPlanning(db, id)
         if (!current) return
         gated.current = allowed
-        setPhase(allowed ? 'ready' : 'email')
+        setPhase(allowed ? 'ready' : 'denied')
       } catch {
         if (current && !gated.current) setPhase('unavailable')
       }
@@ -89,14 +91,12 @@ function Gate({ db, session }: { db: Client; session: Session }) {
 
   function accessLost() {
     gated.current = false
-    setMailStatus('')
     setPhase('loading')
     setRetry((n) => n + 1)
   }
 
   async function signOut() {
     setSignedOut(true)
-    setMailStatus('')
     setError('')
     try {
       const result = await db.auth.signOut({ scope: 'local' })
@@ -129,45 +129,14 @@ function Gate({ db, session }: { db: Client; session: Session }) {
     }, 'Changement non confirmé. Si le nouveau mot de passe a été enregistré, utilisez « Vérifier le changement ».')
   }
 
-  function sendCode() {
-    void act(async () => {
-      const result = await db.rpc('request_email_code').retry(false)
-      if (result.error) throw result.error
-      switch (result.data) {
-        case 'sent': setMailStatus('Code envoyé. Il est valable 10 minutes. Pensez à vérifier les indésirables.'); break
-        case 'wait': setError('Attendez une minute entre deux envois.'); break
-        case 'limit': setError('Limite d’envoi atteinte. Réessayez plus tard.'); break
-        case 'denied':
-        case 'verified': setRetry((n) => n + 1); break
-        default: throw new Error('Envoi indisponible')
-      }
-    }, 'Envoi non confirmé. Vérifiez votre boîte de réception avant de réessayer.')
-  }
-
-  function verify(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault()
-    const form = e.currentTarget
-    const code = String(new FormData(form).get('code')).trim()
-    void act(async () => {
-      const result = await db.rpc('verify_email_code', { p_code: code }).retry(false)
-      if (result.error) throw result.error
-      switch (result.data) {
-        case 'denied':
-        case 'verified': form.reset(); setRetry((n) => n + 1); break
-        case 'invalid': setError('Code incorrect. Vérifiez les six chiffres reçus.'); break
-        case 'expired': setError('Code expiré ou absent pour cette session. Demandez un nouveau code.'); break
-        case 'limit': setError('Trop de tentatives. Demandez un nouveau code.'); break
-        default: throw new Error('Vérification indisponible')
-      }
-    }, 'Code non confirmé. Réessayez avec le dernier code reçu.')
-  }
-
   if (signedOut) return <Panel title="Déconnexion"><p role="status">{error || 'Fermeture de la session…'}</p>{error && <button onClick={() => void signOut()}>Réessayer</button>}</Panel>
   if (phase === 'ready') return <Workspace db={db} id={id} token={token} signOut={() => void signOut()} accessLost={accessLost} />
   if (phase === 'admin') return <Admin db={db} token={token} signOut={() => void signOut()} accessLost={accessLost} />
-  return <Panel title={{ loading: 'Vérification de la session', denied: 'Accès indisponible', unavailable: 'Service inaccessible', password: 'Nouveau mot de passe', email: 'Code de connexion' }[phase]}>
+  if (phase === 'mfa') return <OperatorMfa db={db} pinned={operatorFactorId} onVerified={() => setRetry((n) => n + 1)} signOut={() => void signOut()} />
+  return <Panel title={{ loading: 'Vérification de la session', denied: 'Accès indisponible', unavailable: 'Service inaccessible', password: 'Nouveau mot de passe', reauth: 'Reconnexion nécessaire' }[phase]}>
     {phase === 'loading' && <p role="status">Vérification en cours…</p>}
-    {phase === 'denied' && <p>Cette session ne donne pas accès à l’espace privé. Si vous n’avez plus accès à votre boîte e-mail, contactez la personne chargée des comptes.</p>}
+    {phase === 'denied' && <p>Cette session ne donne pas accès à l’espace privé. Contactez la personne chargée des comptes.</p>}
+    {phase === 'reauth' && <p>La session d’administration a expiré. Déconnectez-vous puis reconnectez-vous avec votre mot de passe.</p>}
     {phase === 'unavailable' && <button onClick={() => setRetry((n) => n + 1)}>Vérifier à nouveau</button>}
     {phase === 'password' && <>
       <p>Remplacez le mot de passe temporaire par un mot de passe unique d’au moins 14 caractères.</p>
@@ -182,16 +151,90 @@ function Gate({ db, session }: { db: Client; session: Session }) {
         setRetry((n) => n + 1)
       }, 'Aucun changement confirmé. Remplacez d’abord le mot de passe temporaire.')}>Vérifier le changement</button>
     </>}
-    {phase === 'email' && <>
-      <p>Recevez un code à usage unique sur l’adresse e-mail associée à votre compte.</p>
-      {mailStatus && <p role="status">{mailStatus}</p>}
-      <form onSubmit={verify}>
-        <label>Code à six chiffres<input name="code" autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required /></label>
-        <button className="primary" disabled={busy}>Vérifier le code</button>
-      </form>
-      <button disabled={busy} onClick={sendCode}>{mailStatus ? 'Renvoyer un code' : 'Envoyer le code par e-mail'}</button>
-    </>}
     {error && <p role="alert">{error}</p>}
     <button className="quiet" disabled={busy} onClick={() => void signOut()}>Déconnexion</button>
+  </Panel>
+}
+
+type MfaStep =
+  | { kind: 'loading' | 'retry' | 'start' | 'missing' }
+  | { kind: 'verify'; id: string }
+  | { kind: 'setup'; id: string; qr: string; secret: string }
+  | { kind: 'pending'; ids: string[] }
+
+function OperatorMfa({ db, pinned, onVerified, signOut }: { db: Client; pinned: string | null; onVerified: () => void; signOut: () => void }) {
+  const [step, setStep] = useState<MfaStep>({ kind: 'loading' })
+  const [retry, setRetry] = useState(0)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let current = true
+    async function load() {
+      try {
+        const { data, error } = await db.auth.mfa.listFactors()
+        if (error) throw error
+        if (!current) return
+        const ids = data.totp.map((factor) => factor.id)
+        setStep(pinned ? (ids.includes(pinned) ? { kind: 'verify', id: pinned } : { kind: 'missing' })
+          : (ids.length ? { kind: 'pending', ids } : { kind: 'start' }))
+      } catch { if (current) setStep({ kind: 'retry' }) }
+    }
+    void load()
+    return () => { current = false }
+  }, [db, pinned, retry])
+
+  async function enroll() {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    try {
+      const { data, error } = await db.auth.mfa.enroll({ factorType: 'totp', issuer: 'Planning IDEL' })
+      if (error) throw error
+      // Supabase JS wraps the raw SVG in a data URL; encode SVG characters for img.
+      const svg = data.totp.qr_code.replace(/^data:image\/svg\+xml;utf-8,/, '')
+      setStep({ kind: 'setup', id: data.id, qr: `data:image/svg+xml,${encodeURIComponent(svg)}`, secret: data.totp.secret })
+    } catch { setError('Configuration indisponible. Réessayez ou contactez le responsable du service.') }
+    finally { setBusy(false) }
+  }
+
+  async function verify(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (busy || (step.kind !== 'setup' && step.kind !== 'verify')) return
+    const form = event.currentTarget
+    const code = String(new FormData(form).get('code') ?? '').trim()
+    if (!/^\d{6}$/.test(code)) return
+    setBusy(true)
+    setError('')
+    try {
+      const { error } = await db.auth.mfa.challengeAndVerify({ factorId: step.id, code })
+      if (error) throw error
+      form.reset()
+      if (step.kind === 'setup') setStep({ kind: 'pending', ids: [step.id] })
+      onVerified()
+    } catch { setError('Code non confirmé. Vérifiez la connexion ou saisissez le prochain code de votre application.') }
+    finally { setBusy(false) }
+  }
+
+  return <Panel title="Vérification de l’administration">
+    {step.kind === 'loading' && <p role="status">Vérification du second facteur…</p>}
+    {step.kind === 'retry' && <><p role="alert">Impossible de vérifier le second facteur.</p><button onClick={() => { setStep({ kind: 'loading' }); setRetry((n) => n + 1) }}>Réessayer</button></>}
+    {step.kind === 'missing' && <p role="alert">Le second facteur autorisé n’est plus disponible. Contactez le responsable du service.</p>}
+    {step.kind === 'start' && <><p>Configurez une application d’authentification. Le responsable du service devra ensuite approuver cet appareil avant le premier accès.</p>
+      <button className="primary" disabled={busy} onClick={() => void enroll()}>Configurer le second facteur</button></>}
+    {step.kind === 'setup' && <>
+      <p>Scannez ce QR code avec votre application d’authentification. Ne partagez ni le QR code ni sa clé.</p>
+      <img src={step.qr} width="180" height="180" alt="QR code de configuration du second facteur" />
+      <details><summary>Afficher la clé de configuration manuelle</summary><code>{step.secret}</code></details>
+    </>}
+    {(step.kind === 'setup' || step.kind === 'verify') && <form onSubmit={verify}>
+      <label>Code de l’application d’authentification<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required /></label>
+      <button className="primary" disabled={busy}>Vérifier le code</button>
+    </form>}
+    {step.kind === 'pending' && <>
+      <p>Second facteur vérifié. Communiquez sa référence au responsable du service, puis reconnectez-vous après son approbation.</p>
+      <ul>{step.ids.map((id) => <li key={id}><code>{id}</code></li>)}</ul>
+    </>}
+    {error && <p role="alert">{error}</p>}
+    <button className="quiet" disabled={busy} onClick={signOut}>Déconnexion</button>
   </Panel>
 }

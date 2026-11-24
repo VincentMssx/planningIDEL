@@ -30,6 +30,12 @@ async function get(path, options = {}) {
 
 const rpcPath = (name) => `rest/v1/rpc/${name}`
 const rpc = (name, token, body = {}) => get(rpcPath(name), { method: 'POST', token, body })
+async function expectDenied(path, options) {
+  const result = await request(path, options)
+  assert.equal(result.ok, false, `${path} must deny access`)
+  assert.equal(result.data?.code, '42501', `${path}: HTTP ${result.status}`)
+}
+const denied = (name, token, body = {}) => expectDenied(rpcPath(name), { method: 'POST', token, body })
 const official = (token) => get('rest/v1/assignments?order=day,tour', { token })
 const adminUsers = 'auth/v1/admin/users'
 
@@ -58,7 +64,7 @@ async function seed() {
     })
     await get('rest/v1/members', { method: 'POST', token: admin, body: { id: user.id, name } })
   }
-  const csv = ['date,tournee_1,tournee_2', ...days.map((day, i) => `${day},${i % 2 ? 'J,Lu' : 'L,F'}`)].join('\n')
+  const csv = ['date,tournee_1,tournee_2', ...days.map((day, i) => `${day},${i === 180 ? ',' : i % 2 ? 'J,Lu' : 'L,F'}`)].join('\n')
   const { rows, errors } = validate(csv)
   assert.deepEqual(errors, [])
   const count = (await official(admin)).length
@@ -67,19 +73,41 @@ async function seed() {
   return rows
 }
 
-async function emailCode(name) {
-  const response = await fetch(`http://mailpit:8025/api/v1/search?query=${encodeURIComponent(`to:${email(name)}`)}`)
-  assert.ok(response.ok)
-  const { messages } = await response.json()
-  assert.ok(messages.length, 'No message arrived in Mailpit.')
-  const detail = await fetch(`http://mailpit:8025/api/v1/message/${messages[0].ID}`)
-  assert.ok(detail.ok)
-  const code = (await detail.json()).Text.match(/ : (\d{6})\./)?.[1]
-  assert.ok(code, 'Message lacks a six-digit code.')
-  return code
+const passwordLogin = (address, pwd) => get('auth/v1/token?grant_type=password', { method: 'POST', body: { email: address, password: pwd } })
+const login = (name, pwd = password) => passwordLogin(email(name), pwd)
+
+function totpCode(base32Secret) {
+  assert.ok(typeof base32Secret === 'string' && /^[A-Z2-7]+=*$/.test(base32Secret), 'Expected a Base32 fixture TOTP secret.')
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  const bytes = []
+  let value = 0
+  let bits = 0
+  for (const char of base32Secret.replace(/=+$/, '')) {
+    value = (value << 5) | alphabet.indexOf(char)
+    bits += 5
+    if (bits >= 8) {
+      bits -= 8
+      bytes.push(value >>> bits)
+      value &= (1 << bits) - 1
+    }
+  }
+  const counter = Buffer.alloc(8)
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000)))
+  const digest = createHmac('sha1', Buffer.from(bytes)).update(counter).digest()
+  const offset = digest[digest.length - 1] & 0x0f
+  return String((digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, '0')
 }
 
-const login = (name, pwd = password) => get('auth/v1/token?grant_type=password', { method: 'POST', body: { email: email(name), password: pwd } })
+async function verifyTotp(token, factor) {
+  const path = `auth/v1/factors/${factor.id}`
+  const { id } = await get(`${path}/challenge`, { method: 'POST', token, body: {} })
+  const { access_token } = await get(`${path}/verify`, {
+    method: 'POST', token, body: { challenge_id: id, code: totpCode(factor.totp.secret) },
+  })
+  return access_token
+}
+
+const jwtClaims = (token) => JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'))
 
 async function verify(rows) {
   const tokens = []
@@ -99,29 +127,29 @@ async function verify(rows) {
     const token = session.access_token
     assert.deepEqual(await rpc('account_state', token), { active: true, must_change_password: true })
     assert.deepEqual(await official(token), [])
-    assert.equal(await rpc('request_email_code', token), 'denied')
+    for (const [name, body] of [['request_email_code', {}], ['verify_email_code', { p_code: '000000' }]]) {
+      assert.equal((await request(rpcPath(name), { method: 'POST', token, body })).status, 404)
+    }
     assert.equal((await request(rpcPath('complete_password_change'), { method: 'POST', token, body: {} })).ok, false)
     await get('auth/v1/user', { method: 'PUT', token, body: { password: `${password}${name}` } })
     await rpc('complete_password_change', token)
     assert.deepEqual(await rpc('account_state', token), { active: true, must_change_password: false })
-    assert.deepEqual(await official(token), [])
-    assert.equal(await rpc('request_email_code', token), 'sent')
-    assert.equal(await rpc('request_email_code', token), 'wait')
-    const code = await emailCode(name)
-    if (name === 'Linda') {
-      const other = (await login(name, `${password}${name}`)).access_token
-      assert.equal(await rpc('verify_email_code', other, { p_code: code }), 'expired')
-      assert.deepEqual(await official(other), [])
-    }
-    assert.equal(await rpc('verify_email_code', token, { p_code: code === '000000' ? '000001' : '000000' }), 'invalid')
-    assert.deepEqual(await official(token), [])
-    assert.equal(await rpc('verify_email_code', token, { p_code: code }), 'verified')
     assert.equal((await official(token)).length, 362)
     tokens.push(token)
     users.push(session.user.id)
   }
 
   const [alice, bob, chloe, fanny] = tokens
+  const freeDay = days.at(-1)
+  const blanks = (await official(alice)).filter((a) => a.day === freeDay)
+  assert.deepEqual(blanks.map((a) => a.member_id), [null, null])
+  const claim = (token) => request(rpcPath('claim_unassigned_slot'), { method: 'POST', token, body: { p_day: freeDay, p_tour: 1 } })
+  assert.equal((await claim(chloe)).ok, false)
+  const claims = await Promise.all([claim(alice), claim(bob)])
+  assert.equal(claims.filter((r) => r.ok).length, 1)
+  const claimed = (await official(alice)).filter((a) => a.day === freeDay)
+  assert.equal(claimed[0].member_id, users[claims.findIndex((r) => r.ok)])
+  assert.equal(claimed[1].member_id, null)
   for (const [name, body] of [['read_colleague_contacts', {}], ['save_colleague_contacts', { p_linda: '', p_julie: '', p_lucie: '' }]]) {
     assert.equal((await request(rpcPath(name), { method: 'POST', token: fanny, body })).status, 404)
   }
@@ -151,7 +179,7 @@ async function verify(rows) {
   assert.deepEqual(await audit(id, 'vote'), [])
   for (const token of [chloe, fanny]) {
     await voteError(token, { p_proposal_id: id, p_approve: true }, '42501')
-    await voteError(token, { p_proposal_id: id, p_approve: false, p_reason: 'Hors binôme.' }, '42501')
+    await voteError(token, { p_proposal_id: id, p_approve: false, p_reason: 'unavailable' }, '42501')
   }
   const accept = (token) => rpc('cast_vote', token, { p_proposal_id: id, p_approve: true })
   assert.equal(await accept(alice), 'pending')
@@ -179,37 +207,41 @@ async function verify(rows) {
     assert.deepEqual(await votes(draft), [])
     assert.equal(await rpc('withdraw_proposal', token, { p_proposal_id: draft }), 'withdrawn')
   }
-  // Pass the later day first: the message link must still use the earliest affected day.
-  const refused = await rpc('create_proposal', alice, { ...create, p_day: second.day, p_other_day: first.day })
-  const reject = { p_proposal_id: refused, p_approve: false }
-  assert.deepEqual(await votes(refused), [])
-  for (const args of [reject, { ...reject, p_reason: ' \n ' }, { ...reject, p_reason: 'x'.repeat(501) }]) {
-    await voteError(alice, args, '22023')
+  const removedPost = await request(rpcPath('post_message'), { method: 'POST', token: alice, body: { p_body: 'Local fixture' } })
+  assert.equal(removedPost.status, 404)
+  assert.equal(removedPost.data?.code, 'PGRST202')
+  for (const reason of ['unavailable', 'schedule_conflict', 'keep_schedule']) {
+    const refused = await rpc('create_proposal', alice, { ...create, p_day: second.day, p_other_day: first.day })
+    const reject = { p_proposal_id: refused, p_approve: false }
+    if (reason === 'unavailable') {
+      await voteError(alice, reject, '22023')
+      for (const invalid of [null, '', ' \n ', 'Not available.', 'unknown', 'Unavailable', ' unavailable', 'unavailable ']) {
+        await voteError(alice, { ...reject, p_reason: invalid }, '22023')
+      }
+      assert.equal((await proposal(refused)).status, 'pending')
+      assert.deepEqual(await votes(refused), [])
+      assert.deepEqual(await audit(refused, 'vote'), [])
+      assert.deepEqual(await audit(refused, 'rejected'), [])
+    }
+    const refuse = () => rpc('cast_vote', alice, { ...reject, p_reason: reason })
+    assert.deepEqual(await Promise.all([refuse(), refuse()]), ['rejected', 'rejected'])
+    await voteError(alice, { ...reject, p_approve: true }, '22023')
+    await voteError(chloe, { ...reject, p_reason: reason }, '42501')
+    assert.equal((await proposal(refused)).status, 'rejected')
+    assert.deepEqual(await official(alice), updated)
+    assert.deepEqual(await votes(refused), [{ member_id: users[0], approve: false }])
+    const refusalVote = await audit(refused, 'vote')
+    assert.equal(refusalVote.length, 1)
+    assert.deepEqual(refusalVote[0].details, { approve: false, reason_code: reason })
+    const refusalAudit = await audit(refused, 'rejected')
+    assert.equal(refusalAudit.length, 1)
+    assert.equal(refusalAudit[0].actor_id, users[0])
+    assert.deepEqual(refusalAudit[0].days, [first.day, second.day])
+    assert.equal(refusalAudit[0].details.reason_code, reason)
+    assert.equal(Object.hasOwn(refusalAudit[0].details, 'reason'), false)
+    assert.equal(refusalAudit[0].details.lines.length, 2)
   }
-  assert.deepEqual(await get('rest/v1/messages', { token: bob }), [])
-  assert.deepEqual(await Promise.all([1, 2].map(() => rpc('cast_vote', alice, { ...reject, p_reason: '  Indisponible ce jour.  ' }))), ['rejected', 'rejected'])
-  await voteError(alice, { ...reject, p_approve: true }, '22023')
-  await voteError(chloe, { ...reject, p_reason: 'Hors binôme.' }, '42501')
-  assert.deepEqual(await official(alice), updated)
-  assert.deepEqual(await votes(refused), [{ member_id: users[0], approve: false }])
-  const refusalVote = await audit(refused, 'vote')
-  assert.equal(refusalVote.length, 1)
-  assert.deepEqual(refusalVote[0].details, { approve: false, reason: 'Indisponible ce jour.' })
-  const refusalAudit = await audit(refused, 'rejected')
-  assert.equal(refusalAudit.length, 1)
-  assert.equal(refusalAudit[0].details.reason, 'Indisponible ce jour.')
-  assert.equal(refusalAudit[0].details.lines.length, 2)
-  const displayDay = (day) => day.split('-').reverse().join('/')
-  const participantName = (id) => names[users.indexOf(id)]
-  assert.deepEqual(await get('rest/v1/messages?select=member_id,body,proposal_id,proposal_day', { token: bob }), [{
-    member_id: users[0], proposal_id: refused, proposal_day: first.day,
-    body: `Demande refusée · Échange\nProposition de Linda\n${displayDay(first.day)} (Tournée 1) : ${participantName(second.member_id)} → ${participantName(first.member_id)}\n${displayDay(second.day)} (Tournée 1) : ${participantName(first.member_id)} → ${participantName(second.member_id)}\nMotif : Indisponible ce jour.`,
-  }])
-  const text = `Demande refusée · ${displayDay(first.day)} (Tournée 1)\nMotif : Recette locale fictive`
-  const messageId = await rpc('post_message', alice, { p_body: `  ${text}  ` })
-  assert.deepEqual(await get(`rest/v1/messages?id=eq.${messageId}&select=body,proposal_id,proposal_day`, { token: bob }), [
-    { body: text, proposal_id: null, proposal_day: null },
-  ])
+  for (const token of [bob, admin]) await expectDenied('rest/v1/messages', { token })
 
   const tested = users[0]
   const setActive = (active) => get(`rest/v1/members?id=eq.${tested}`, { method: 'PATCH', token: admin, body: { active } })
@@ -226,15 +258,46 @@ async function verify(rows) {
   const address = 'operator@example.test'
   const passphrase = `${password}Operator`
   const operatorId = await createOperator(address, passphrase)
-  const operator = (await get('auth/v1/token?grant_type=password', { method: 'POST', body: { email: address, password: passphrase } })).access_token
-  const denied = async (name, token, body = {}) => assert.equal((await request(rpcPath(name), { method: 'POST', token, body })).data?.code, '42501')
+  const enrollmentToken = (await passwordLogin(address, passphrase)).access_token
   await denied('provision_operator', fanny, { p_user_id: operatorId })
   await denied('admin_overview', fanny)
-  await denied('admin_overview', operator)
-  assert.equal(await rpc('request_email_code', operator), 'sent')
-  assert.equal(await rpc('verify_email_code', operator, { p_code: await emailCode('Operator') }), 'verified')
+  const operatorState = async (token, factorId, verified) => assert.deepEqual(await rpc('account_state', token), {
+    active: true, must_change_password: false, operator: true, verified,
+    operator_session_fresh: true, operator_factor_id: factorId,
+  })
+  await operatorState(enrollmentToken, null, false)
+  await denied('admin_overview', enrollmentToken)
+  const factor = await get('auth/v1/factors', {
+    method: 'POST', token: enrollmentToken, body: { factor_type: 'totp', friendly_name: 'Local fixture' },
+  })
+  assert.equal(factor.type, 'totp')
+  assert.ok(typeof factor.id === 'string' && factor.id, 'Expected a fixture factor ID.')
+  const beforeApproval = await verifyTotp(enrollmentToken, factor)
+  assert.equal(jwtClaims(beforeApproval).aal, 'aal2')
+  await operatorState(beforeApproval, null, false)
+  await denied('admin_overview', beforeApproval)
+  const approval = { p_operator_id: operatorId, p_factor_id: factor.id }
+  for (const token of [anon, fanny, beforeApproval]) await denied('approve_operator_totp', token, approval)
+  await rpc('approve_operator_totp', admin, approval)
+  assert.deepEqual(await rpc('account_state', beforeApproval), { active: false, must_change_password: false })
+  await denied('admin_overview', beforeApproval)
+
+  const passwordOnly = (await passwordLogin(address, passphrase)).access_token
+  await operatorState(passwordOnly, factor.id, false)
+  await denied('admin_overview', passwordOnly)
+  const operator = await verifyTotp(passwordOnly, factor)
+  const passwordClaims = jwtClaims(passwordOnly)
+  const operatorClaims = jwtClaims(operator)
+  assert.equal(passwordClaims.aal, 'aal1')
+  assert.equal(operatorClaims.aal, 'aal2')
+  assert.ok(passwordClaims.session_id)
+  assert.equal(operatorClaims.session_id, passwordClaims.session_id)
+  await operatorState(operator, factor.id, true)
+  await operatorState(passwordOnly, factor.id, false)
+  await denied('admin_overview', passwordOnly)
   assert.deepEqual(await official(operator), [])
-  assert.deepEqual(await get('rest/v1/messages', { token: operator }), [])
+  await denied('create_proposal', operator, replace)
+  await expectDenied('rest/v1/messages', { token: operator })
   const overview = await rpc('admin_overview', operator)
   assert.equal(overview.members.length, 4)
   const fannyId = overview.members.find((member) => member.name === 'Fanny').id
@@ -243,7 +306,7 @@ async function verify(rows) {
     assert.deepEqual(await official(fanny), [])
   }
   assert.deepEqual((await rpc('admin_overview', operator)).history.map((entry) => [entry.name, entry.active]), [['Fanny', true], ['Fanny', false]])
-  console.log('Verified: real Auth tokens, email code, retired contacts API, two explicit participant votes, a single linked refusal message, account recovery and isolated audited operator access.')
+  console.log('Verified: member password login, retired OTP, contacts and messages APIs, participant votes with refusal codes, account recovery, and isolated audited operator access with approved TOTP.')
 }
 
 switch (process.argv[2]) {

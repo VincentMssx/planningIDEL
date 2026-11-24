@@ -13,8 +13,8 @@ enable_signup = false
 enable_confirmations = false
 
 [auth.mfa.totp]
-enroll_enabled = false
-verify_enabled = false
+enroll_enabled = true
+verify_enabled = true
 
 [auth.hook.send_email]
 enabled = true

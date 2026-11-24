@@ -20,16 +20,16 @@ export function validate(csv) {
     else if (!semester.has(day)) reasons.push('date hors semestre')
     else if (seen.has(day)) reasons.push('date en double')
     else seen.add(day)
-    if (!people.has(first) || !people.has(second)) reasons.push('codes attendus : L, J, Lu, F (aucune case vide)')
-    else if (first === second) reasons.push('même personne sur les deux tournées')
+    if ([first, second].some((code) => code !== '' && !people.has(code))) reasons.push('codes attendus : L, J, Lu, F ou case vide')
+    else if (first && first === second) reasons.push('même personne sur les deux tournées')
     if (reasons.length) {
       errors.push(`Ligne ${i + 1} : ${reasons.join(' ; ')}`)
       continue
     }
     for (const [index, code] of [first, second].entries()) {
       const tour = index + 1
-      rows.push({ day, tour, name: people.get(code) })
-      if ((tour === 1) !== (code === 'L' || code === 'J')) exceptions.push(`Ligne ${i + 1}, ${day}, tournée ${tour} : ${code}`)
+      rows.push({ day, tour, name: people.get(code) ?? null })
+      if (code && (tour === 1) !== (code === 'L' || code === 'J')) exceptions.push(`Ligne ${i + 1}, ${day}, tournée ${tour} : ${code}`)
     }
   }
   for (const day of days) if (!seen.has(day)) errors.push(`Date manquante : ${day}`)
@@ -46,7 +46,7 @@ export async function run(args, env = process.env, request = fetch, log = consol
   const { errors, exceptions, rows } = validate(csv)
   if (exceptions.length) log.info(`Exceptions de binôme :\n${exceptions.join('\n')}`)
   if (errors.length) throw new Error(errors.join('\n'))
-  log.info(`${days.length} jours, ${rows.length} créneaux valides.`)
+  log.info(`${days.length} jours, ${rows.length} créneaux valides, dont ${rows.filter((row) => row.name === null).length} à définir.`)
   if (mode === 'validate') return
   const { SUPABASE_URL: url, SUPABASE_SERVICE_ROLE_KEY: key } = env
   if (!url || !key) throw new Error('SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis.')

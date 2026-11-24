@@ -11,7 +11,10 @@ export function configuredClient() {
 }
 
 export type Client = NonNullable<ReturnType<typeof configuredClient>>
-export type AccountState = { active: boolean; must_change_password: boolean; operator?: boolean; verified?: boolean }
+export type AccountState = {
+  active: boolean; must_change_password: boolean; operator?: boolean; verified?: boolean;
+  operator_session_fresh?: boolean; operator_factor_id?: string | null;
+}
 
 export async function readAccount(db: Client) {
   const { data, error } = await db.rpc('account_state')
@@ -26,18 +29,27 @@ export async function canReadPlanning(db: Client, id: string) {
 }
 export type Tour = 1 | 2
 export type Member = { id: string; name: string; active: boolean }
-export type Assignment = { day: string; tour: Tour; member_id: string; version: number }
+export type Assignment = { day: string; tour: Tour; member_id: string | null; version: number }
+export const assigned = (row: Assignment | undefined): row is Assignment & { member_id: string } => !!row?.member_id
 export type ProposalStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'obsolete'
 export type Proposal = { id: string; author_id: string; status: ProposalStatus; created_at: string; expires_on: string }
 export type Line = { proposal_id: string; day: string; tour: Tour; before_id: string; after_id: string; before_version: number }
 export type Vote = { proposal_id: string; member_id: string; approve: boolean; created_at: string }
+export const REFUSAL_REASONS = {
+  unavailable: 'Indisponible',
+  schedule_conflict: 'Conflit de planning',
+  keep_schedule: 'Conserver le planning actuel',
+} as const
+export type RefusalReason = keyof typeof REFUSAL_REASONS
+export const isRefusalReason = (reason: unknown): reason is RefusalReason =>
+  typeof reason === 'string' && Object.hasOwn(REFUSAL_REASONS, reason)
+
 export type AuditDetails = Record<string, unknown> & {
   lines?: Line[]
   event_actor_id?: string | null
   proposal_created_at?: string | null
 }
 export type Audit = { id: string; kind: string; actor_id: string | null; proposal_id: string | null; days: string[]; details: AuditDetails; created_at: string }
-export type Message = { id: string; member_id: string; body: string; created_at: string; proposal_id?: string | null; proposal_day?: string | null }
 export type Snapshot = { members: Member[]; assignments: Assignment[]; proposals: Proposal[]; lines: Line[]; votes: Vote[] }
 
 export const FIRST_DAY = '2027-01-01'
@@ -122,15 +134,13 @@ export async function readSnapshot(db: Client, day: string | null = null): Promi
 export const PAGE_SIZE = 20
 export type HistoryFilter = 'all' | 'accepted' | 'rejected'
 
-export async function readFeed(db: Client, table: 'audit' | 'messages', day: string, cursor?: Audit | Message, history: HistoryFilter = 'all') {
-  let query = table === 'audit'
-    ? db.from('grouped_history').select('id,kind,actor_id,proposal_id,days,details,created_at')
-    : db.from('messages').select('id,member_id,body,created_at,proposal_id,proposal_day')
-  if (table === 'audit' && day) query = query.contains('days', [day])
-  if (table === 'audit' && history !== 'all') query = query.eq('kind', history)
+export async function readHistory(db: Client, day: string, cursor?: Audit, history: HistoryFilter = 'all') {
+  let query = db.from('grouped_history').select('id,kind,actor_id,proposal_id,days,details,created_at')
+  if (day) query = query.contains('days', [day])
+  if (history !== 'all') query = query.eq('kind', history)
   if (cursor) query = query.or(`created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`)
   const { data, error } = await query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(PAGE_SIZE + 1)
   if (error) throw error
-  const rows = data as (Audit | Message)[]
+  const rows = data as Audit[]
   return { rows: rows.slice(0, PAGE_SIZE), more: rows.length > PAGE_SIZE }
 }
