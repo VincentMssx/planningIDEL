@@ -10,3 +10,6 @@ dist/
 *.csv
 supabase/.temp/
 supabase/.branches/
+
+.vercel
+.env*

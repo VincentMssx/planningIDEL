@@ -122,21 +122,9 @@ async function verify(rows) {
   }
 
   const [alice, bob, chloe, fanny] = tokens
-  const contactInput = { p_linda: 'linda-contact@example.test', p_julie: 'julie-contact@example.test', p_lucie: '' }
-  assert.deepEqual(await rpc('read_colleague_contacts', fanny), {})
-  for (const token of [anon, alice, bob, chloe]) {
-    for (const [name, body] of [['read_colleague_contacts', {}], ['save_colleague_contacts', contactInput]]) {
-      assert.equal((await request(rpcPath(name), { method: 'POST', token, body })).data?.code, '42501')
-    }
+  for (const [name, body] of [['read_colleague_contacts', {}], ['save_colleague_contacts', { p_linda: '', p_julie: '', p_lucie: '' }]]) {
+    assert.equal((await request(rpcPath(name), { method: 'POST', token: fanny, body })).status, 404)
   }
-  await rpc('save_colleague_contacts', fanny, contactInput)
-  const contacts = { Linda: contactInput.p_linda, Julie: contactInput.p_julie }
-  assert.deepEqual(await rpc('read_colleague_contacts', fanny), contacts)
-  assert.equal((await request(rpcPath('save_colleague_contacts'), { method: 'POST', token: fanny, body: { ...contactInput, p_lucie: 'invalide' } })).data?.code, '22023')
-  assert.deepEqual(await rpc('read_colleague_contacts', fanny), contacts)
-  assert.ok((await login('Linda', `${password}Linda`)).access_token)
-  await rpc('save_colleague_contacts', fanny, { ...contactInput, p_linda: '' })
-  assert.deepEqual(await rpc('read_colleague_contacts', fanny), { Julie: contactInput.p_julie })
   assert.equal((await request(rpcPath('import_schedule'), { method: 'POST', token: alice, body: { p_rows: [] } })).ok, false)
   assert.equal((await request('rest/v1/assignments?tour=eq.1', { method: 'PATCH', token: alice, body: { version: 99 } })).ok, false)
   const planning = await official(alice)
@@ -145,23 +133,83 @@ async function verify(rows) {
   const second = first && planning.find((a) => a.tour === 1 && a.day > first.day && a.day.slice(0, 7) !== first.day.slice(0, 7) && a.member_id !== first.member_id)
   assert.ok(first && second, 'Two future months are needed for the exchange scenario.')
   const create = { p_tour: 1, p_day: first.day, p_other_day: second.day }
-  const concurrent = await Promise.all([alice, bob].map((token) => request(rpcPath('create_proposal'), { method: 'POST', token, body: create })))
+  const concurrent = await Promise.all([chloe, fanny].map((token) => request(rpcPath('create_proposal'), { method: 'POST', token, body: create })))
   assert.equal(concurrent.filter((result) => result.ok).length, 1)
   const winner = concurrent.findIndex((result) => result.ok)
   const id = concurrent[winner].data
+  assert.equal(concurrent[1 - winner].data?.code, '22023')
+  const proposal = async (id) => (await get(`rest/v1/proposals?id=eq.${id}&select=author_id,status`, { token: alice }))[0]
+  const votes = (id) => get(`rest/v1/votes?proposal_id=eq.${id}&select=member_id,approve`, { token: alice })
+  const audit = (id, kind) => get(`rest/v1/audit?proposal_id=eq.${id}&kind=eq.${kind}&select=actor_id,days,details`, { token: alice })
+  const voteError = async (token, body, code) => {
+    const result = await request(rpcPath('cast_vote'), { method: 'POST', token, body })
+    assert.equal(result.ok, false)
+    assert.equal(result.data?.code, code)
+  }
+  assert.deepEqual(await proposal(id), { author_id: users[2 + winner], status: 'pending' })
+  assert.deepEqual(await votes(id), [])
+  assert.deepEqual(await audit(id, 'vote'), [])
+  for (const token of [chloe, fanny]) {
+    await voteError(token, { p_proposal_id: id, p_approve: true }, '42501')
+    await voteError(token, { p_proposal_id: id, p_approve: false, p_reason: 'Hors binôme.' }, '42501')
+  }
   const accept = (token) => rpc('cast_vote', token, { p_proposal_id: id, p_approve: true })
-  assert.equal(await accept(tokens[1 - winner]), 'pending')
-  assert.equal(await accept(chloe), 'pending')
+  assert.equal(await accept(alice), 'pending')
+  assert.equal(await accept(alice), 'pending')
+  assert.deepEqual(await votes(id), [{ member_id: users[0], approve: true }])
+  assert.equal((await audit(id, 'vote')).length, 1)
   assert.deepEqual(await official(alice), planning)
-  assert.deepEqual(await Promise.all([accept(fanny), accept(fanny)]), ['accepted', 'accepted'])
+  assert.deepEqual(await Promise.all([accept(bob), accept(bob)]), ['accepted', 'accepted'])
+  assert.equal((await votes(id)).length, 2)
+  assert.equal((await audit(id, 'vote')).length, 2)
+  const acceptedAudit = await audit(id, 'accepted')
+  assert.equal(acceptedAudit.length, 1)
+  assert.equal(acceptedAudit[0].actor_id, users[1])
+  assert.deepEqual(acceptedAudit[0].days, [first.day, second.day])
   const updated = await official(alice)
   const slot = (day) => updated.find((a) => a.day === day && a.tour === 1)
   assert.equal(slot(first.day).member_id, second.member_id)
   assert.equal(slot(second.day).member_id, first.member_id)
   assert.equal(slot(first.day).version, first.version + 1)
   assert.equal(slot(second.day).version, second.version + 1)
-  await rpc('post_message', alice, { p_body: '  Recette locale fictive  ' })
-  assert.equal((await get('rest/v1/messages?select=body', { token: bob }))[0].body, 'Recette locale fictive')
+  const replace = { p_tour: 1, p_day: first.day, p_after_id: first.member_id }
+  for (const [i, token] of tokens.entries()) {
+    const draft = await rpc('create_proposal', token, replace)
+    assert.deepEqual(await proposal(draft), { author_id: users[i], status: 'pending' })
+    assert.deepEqual(await votes(draft), [])
+    assert.equal(await rpc('withdraw_proposal', token, { p_proposal_id: draft }), 'withdrawn')
+  }
+  // Pass the later day first: the message link must still use the earliest affected day.
+  const refused = await rpc('create_proposal', alice, { ...create, p_day: second.day, p_other_day: first.day })
+  const reject = { p_proposal_id: refused, p_approve: false }
+  assert.deepEqual(await votes(refused), [])
+  for (const args of [reject, { ...reject, p_reason: ' \n ' }, { ...reject, p_reason: 'x'.repeat(501) }]) {
+    await voteError(alice, args, '22023')
+  }
+  assert.deepEqual(await get('rest/v1/messages', { token: bob }), [])
+  assert.deepEqual(await Promise.all([1, 2].map(() => rpc('cast_vote', alice, { ...reject, p_reason: '  Indisponible ce jour.  ' }))), ['rejected', 'rejected'])
+  await voteError(alice, { ...reject, p_approve: true }, '22023')
+  await voteError(chloe, { ...reject, p_reason: 'Hors binôme.' }, '42501')
+  assert.deepEqual(await official(alice), updated)
+  assert.deepEqual(await votes(refused), [{ member_id: users[0], approve: false }])
+  const refusalVote = await audit(refused, 'vote')
+  assert.equal(refusalVote.length, 1)
+  assert.deepEqual(refusalVote[0].details, { approve: false, reason: 'Indisponible ce jour.' })
+  const refusalAudit = await audit(refused, 'rejected')
+  assert.equal(refusalAudit.length, 1)
+  assert.equal(refusalAudit[0].details.reason, 'Indisponible ce jour.')
+  assert.equal(refusalAudit[0].details.lines.length, 2)
+  const displayDay = (day) => day.split('-').reverse().join('/')
+  const participantName = (id) => names[users.indexOf(id)]
+  assert.deepEqual(await get('rest/v1/messages?select=member_id,body,proposal_id,proposal_day', { token: bob }), [{
+    member_id: users[0], proposal_id: refused, proposal_day: first.day,
+    body: `Demande refusée · Échange\nProposition de Linda\n${displayDay(first.day)} (Tournée 1) : ${participantName(second.member_id)} → ${participantName(first.member_id)}\n${displayDay(second.day)} (Tournée 1) : ${participantName(first.member_id)} → ${participantName(second.member_id)}\nMotif : Indisponible ce jour.`,
+  }])
+  const text = `Demande refusée · ${displayDay(first.day)} (Tournée 1)\nMotif : Recette locale fictive`
+  const messageId = await rpc('post_message', alice, { p_body: `  ${text}  ` })
+  assert.deepEqual(await get(`rest/v1/messages?id=eq.${messageId}&select=body,proposal_id,proposal_day`, { token: bob }), [
+    { body: text, proposal_id: null, proposal_day: null },
+  ])
 
   const tested = users[0]
   const setActive = (active) => get(`rest/v1/members?id=eq.${tested}`, { method: 'PATCH', token: admin, body: { active } })
@@ -187,7 +235,6 @@ async function verify(rows) {
   assert.equal(await rpc('verify_email_code', operator, { p_code: await emailCode('Operator') }), 'verified')
   assert.deepEqual(await official(operator), [])
   assert.deepEqual(await get('rest/v1/messages', { token: operator }), [])
-  await denied('read_colleague_contacts', operator)
   const overview = await rpc('admin_overview', operator)
   assert.equal(overview.members.length, 4)
   const fannyId = overview.members.find((member) => member.name === 'Fanny').id
@@ -196,7 +243,7 @@ async function verify(rows) {
     assert.deepEqual(await official(fanny), [])
   }
   assert.deepEqual((await rpc('admin_overview', operator)).history.map((entry) => [entry.name, entry.active]), [['Fanny', true], ['Fanny', false]])
-  console.log('Verified: real Auth tokens, email code, Fanny-only contacts, concurrent votes, account recovery and isolated audited operator access.')
+  console.log('Verified: real Auth tokens, email code, retired contacts API, two explicit participant votes, a single linked refusal message, account recovery and isolated audited operator access.')
 }
 
 switch (process.argv[2]) {

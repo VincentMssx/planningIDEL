@@ -31,8 +31,13 @@ export type ProposalStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn' |
 export type Proposal = { id: string; author_id: string; status: ProposalStatus; created_at: string; expires_on: string }
 export type Line = { proposal_id: string; day: string; tour: Tour; before_id: string; after_id: string; before_version: number }
 export type Vote = { proposal_id: string; member_id: string; approve: boolean; created_at: string }
-export type Audit = { id: string; kind: string; actor_id: string | null; proposal_id: string | null; days: string[]; details: Record<string, unknown>; created_at: string }
-export type Message = { id: string; member_id: string; body: string; created_at: string }
+export type AuditDetails = Record<string, unknown> & {
+  lines?: Line[]
+  event_actor_id?: string | null
+  proposal_created_at?: string | null
+}
+export type Audit = { id: string; kind: string; actor_id: string | null; proposal_id: string | null; days: string[]; details: AuditDetails; created_at: string }
+export type Message = { id: string; member_id: string; body: string; created_at: string; proposal_id?: string | null; proposal_day?: string | null }
 export type Snapshot = { members: Member[]; assignments: Assignment[]; proposals: Proposal[]; lines: Line[]; votes: Vote[] }
 
 export const FIRST_DAY = '2027-01-01'
@@ -115,12 +120,14 @@ export async function readSnapshot(db: Client, day: string | null = null): Promi
 }
 
 export const PAGE_SIZE = 20
+export type HistoryFilter = 'all' | 'accepted' | 'rejected'
 
-export async function readFeed(db: Client, table: 'audit' | 'messages', day: string, cursor?: Audit | Message) {
+export async function readFeed(db: Client, table: 'audit' | 'messages', day: string, cursor?: Audit | Message, history: HistoryFilter = 'all') {
   let query = table === 'audit'
-    ? db.from('audit').select('id,kind,actor_id,proposal_id,days,details,created_at')
-    : db.from('messages').select('id,member_id,body,created_at')
+    ? db.from('grouped_history').select('id,kind,actor_id,proposal_id,days,details,created_at')
+    : db.from('messages').select('id,member_id,body,created_at,proposal_id,proposal_day')
   if (table === 'audit' && day) query = query.contains('days', [day])
+  if (table === 'audit' && history !== 'all') query = query.eq('kind', history)
   if (cursor) query = query.or(`created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`)
   const { data, error } = await query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(PAGE_SIZE + 1)
   if (error) throw error

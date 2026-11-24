@@ -92,6 +92,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       args:
+        VITE_HIDE_PLANNING_REFRESH: "true"
         VITE_SUPABASE_URL: *local-origin
         VITE_SUPABASE_PUBLISHABLE_KEY: &local-anon eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InBsYW5uaW5nLWlkZWwtbG9jYWwifQ.IJf_6tfrR9osxq637hsSmLOYtMsyhXOVCfbORUlHYME
     depends_on:
