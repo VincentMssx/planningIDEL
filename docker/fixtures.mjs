@@ -33,6 +33,20 @@ const rpc = (name, token, body = {}) => get(rpcPath(name), { method: 'POST', tok
 const official = (token) => get('rest/v1/assignments?order=day,tour', { token })
 const adminUsers = 'auth/v1/admin/users'
 
+async function createOperator(address, passphrase) {
+  assert.ok(typeof address === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address), 'A valid operator email is required.')
+  assert.ok(typeof passphrase === 'string' && passphrase.length >= 20, 'Use a unique password of at least 20 characters.')
+  const created = await request(adminUsers, { method: 'POST', token: admin, body: { email: address, password: passphrase, email_confirm: true } })
+  assert.ok(created.ok, `Operator Auth creation failed (HTTP ${created.status}); existing accounts are not promoted.`)
+  try {
+    await rpc('provision_operator', admin, { p_user_id: created.data.id })
+  } catch {
+    // Do not delete the Auth user on an ambiguous network failure: the role may already exist.
+    throw new Error('Operator role not confirmed. Check the local database before retrying.')
+  }
+  return created.data.id
+}
+
 async function seed() {
   const existing = await get('rest/v1/members?select=id,name', { token: admin })
   const { users } = await get(adminUsers, { token: admin })
@@ -53,14 +67,16 @@ async function seed() {
   return rows
 }
 
-function totp(key) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
-  const bits = [...key.toUpperCase().replace(/=+$/, '')].map((c) => alphabet.indexOf(c).toString(2).padStart(5, '0')).join('')
-  const binary = Buffer.from((bits.match(/.{8}/g) ?? []).map((b) => Number.parseInt(b, 2)))
-  const time = Buffer.alloc(8)
-  time.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000)))
-  const hmac = createHmac('sha1', binary).update(time).digest()
-  return String((hmac.readUInt32BE(hmac.at(-1) & 15) & 0x7fffffff) % 1_000_000).padStart(6, '0')
+async function emailCode(name) {
+  const response = await fetch(`http://mailpit:8025/api/v1/search?query=${encodeURIComponent(`to:${email(name)}`)}`)
+  assert.ok(response.ok)
+  const { messages } = await response.json()
+  assert.ok(messages.length, 'No message arrived in Mailpit.')
+  const detail = await fetch(`http://mailpit:8025/api/v1/message/${messages[0].ID}`)
+  assert.ok(detail.ok)
+  const code = (await detail.json()).Text.match(/ : (\d{6})\./)?.[1]
+  assert.ok(code, 'Message lacks a six-digit code.')
+  return code
 }
 
 const login = (name, pwd = password) => get('auth/v1/token?grant_type=password', { method: 'POST', body: { email: email(name), password: pwd } })
@@ -72,28 +88,55 @@ async function verify(rows) {
   assert.equal((await request('auth/v1/signup', { method: 'POST', body: { email: 'outsider@example.test', password } })).ok, false)
   assert.equal((await request(rpcPath('import_schedule'), { method: 'POST', token: admin, body: { p_rows: rows } })).ok, false)
   const members = await get('rest/v1/members?select=id,name,must_change_password', { token: admin })
-  assert.ok(members.every((member) => member.must_change_password), 'Run verify only on fresh fixtures; it changes passwords and enrolls TOTP.')
+  assert.ok(members.every((member) => member.must_change_password), 'Run verify only on fresh fixtures; it changes passwords.')
+  for (const path of ['otp', 'recover']) {
+    const blocked = await request(`auth/v1/${path}`, { method: 'POST', body: { email: email('Linda') } })
+    assert.equal(blocked.ok, false, `${path} must not bypass password sign-in`)
+  }
 
   for (const name of names) {
     const session = await login(name)
     const token = session.access_token
     assert.deepEqual(await rpc('account_state', token), { active: true, must_change_password: true })
     assert.deepEqual(await official(token), [])
+    assert.equal(await rpc('request_email_code', token), 'denied')
     assert.equal((await request(rpcPath('complete_password_change'), { method: 'POST', token, body: {} })).ok, false)
     await get('auth/v1/user', { method: 'PUT', token, body: { password: `${password}${name}` } })
     await rpc('complete_password_change', token)
     assert.deepEqual(await rpc('account_state', token), { active: true, must_change_password: false })
     assert.deepEqual(await official(token), [])
-    const factor = await get('auth/v1/factors', { method: 'POST', token, body: { factor_type: 'totp' } })
-    const challenge = await get(`auth/v1/factors/${factor.id}/challenge`, { method: 'POST', token, body: {} })
-    const verified = await get(`auth/v1/factors/${factor.id}/verify`, { method: 'POST', token, body: { challenge_id: challenge.id, code: totp(factor.totp.secret) } })
-    assert.equal((await official(verified.access_token)).length, 362)
+    assert.equal(await rpc('request_email_code', token), 'sent')
+    assert.equal(await rpc('request_email_code', token), 'wait')
+    const code = await emailCode(name)
+    if (name === 'Linda') {
+      const other = (await login(name, `${password}${name}`)).access_token
+      assert.equal(await rpc('verify_email_code', other, { p_code: code }), 'expired')
+      assert.deepEqual(await official(other), [])
+    }
+    assert.equal(await rpc('verify_email_code', token, { p_code: code === '000000' ? '000001' : '000000' }), 'invalid')
     assert.deepEqual(await official(token), [])
-    tokens.push(verified.access_token)
-    users.push({ id: session.user.id, factor: factor.id })
+    assert.equal(await rpc('verify_email_code', token, { p_code: code }), 'verified')
+    assert.equal((await official(token)).length, 362)
+    tokens.push(token)
+    users.push(session.user.id)
   }
 
   const [alice, bob, chloe, fanny] = tokens
+  const contactInput = { p_linda: 'linda-contact@example.test', p_julie: 'julie-contact@example.test', p_lucie: '' }
+  assert.deepEqual(await rpc('read_colleague_contacts', fanny), {})
+  for (const token of [anon, alice, bob, chloe]) {
+    for (const [name, body] of [['read_colleague_contacts', {}], ['save_colleague_contacts', contactInput]]) {
+      assert.equal((await request(rpcPath(name), { method: 'POST', token, body })).data?.code, '42501')
+    }
+  }
+  await rpc('save_colleague_contacts', fanny, contactInput)
+  const contacts = { Linda: contactInput.p_linda, Julie: contactInput.p_julie }
+  assert.deepEqual(await rpc('read_colleague_contacts', fanny), contacts)
+  assert.equal((await request(rpcPath('save_colleague_contacts'), { method: 'POST', token: fanny, body: { ...contactInput, p_lucie: 'invalide' } })).data?.code, '22023')
+  assert.deepEqual(await rpc('read_colleague_contacts', fanny), contacts)
+  assert.ok((await login('Linda', `${password}Linda`)).access_token)
+  await rpc('save_colleague_contacts', fanny, { ...contactInput, p_linda: '' })
+  assert.deepEqual(await rpc('read_colleague_contacts', fanny), { Julie: contactInput.p_julie })
   assert.equal((await request(rpcPath('import_schedule'), { method: 'POST', token: alice, body: { p_rows: [] } })).ok, false)
   assert.equal((await request('rest/v1/assignments?tour=eq.1', { method: 'PATCH', token: alice, body: { version: 99 } })).ok, false)
   const planning = await official(alice)
@@ -121,20 +164,39 @@ async function verify(rows) {
   assert.equal((await get('rest/v1/messages?select=body', { token: bob }))[0].body, 'Recette locale fictive')
 
   const tested = users[0]
-  const setActive = (active) => get(`rest/v1/members?id=eq.${tested.id}`, { method: 'PATCH', token: admin, body: { active } })
+  const setActive = (active) => get(`rest/v1/members?id=eq.${tested}`, { method: 'PATCH', token: admin, body: { active } })
   await setActive(false)
   assert.deepEqual(await official(alice), [])
   await get('auth/v1/logout?scope=global', { method: 'POST', token: alice })
-  await get(`${adminUsers}/${tested.id}/factors/${tested.factor}`, { method: 'DELETE', token: admin })
-  await get(`${adminUsers}/${tested.id}`, { method: 'PUT', token: admin, body: { password } })
-  await rpc('require_password_change', admin, { p_member_id: tested.id })
+  await get(`${adminUsers}/${tested}`, { method: 'PUT', token: admin, body: { password } })
+  await rpc('require_password_change', admin, { p_member_id: tested })
   await setActive(true)
   assert.deepEqual(await rpc('account_state', alice), { active: false, must_change_password: false })
   assert.deepEqual(await official(alice), [])
   const recovered = await login('Linda')
   assert.deepEqual(await rpc('account_state', recovered.access_token), { active: true, must_change_password: true })
-  assert.deepEqual((await get('auth/v1/user', { token: recovered.access_token })).factors ?? [], [])
-  console.log('Verified: real Auth tokens, TOTP, access control, concurrent creation and final vote, official exchange, chat and account recovery.')
+  const address = 'operator@example.test'
+  const passphrase = `${password}Operator`
+  const operatorId = await createOperator(address, passphrase)
+  const operator = (await get('auth/v1/token?grant_type=password', { method: 'POST', body: { email: address, password: passphrase } })).access_token
+  const denied = async (name, token, body = {}) => assert.equal((await request(rpcPath(name), { method: 'POST', token, body })).data?.code, '42501')
+  await denied('provision_operator', fanny, { p_user_id: operatorId })
+  await denied('admin_overview', fanny)
+  await denied('admin_overview', operator)
+  assert.equal(await rpc('request_email_code', operator), 'sent')
+  assert.equal(await rpc('verify_email_code', operator, { p_code: await emailCode('Operator') }), 'verified')
+  assert.deepEqual(await official(operator), [])
+  assert.deepEqual(await get('rest/v1/messages', { token: operator }), [])
+  await denied('read_colleague_contacts', operator)
+  const overview = await rpc('admin_overview', operator)
+  assert.equal(overview.members.length, 4)
+  const fannyId = overview.members.find((member) => member.name === 'Fanny').id
+  for (const active of [false, true]) {
+    await rpc('admin_set_member_active', operator, { p_member_id: fannyId, p_active: active })
+    assert.deepEqual(await official(fanny), [])
+  }
+  assert.deepEqual((await rpc('admin_overview', operator)).history.map((entry) => [entry.name, entry.active]), [['Fanny', true], ['Fanny', false]])
+  console.log('Verified: real Auth tokens, email code, Fanny-only contacts, concurrent votes, account recovery and isolated audited operator access.')
 }
 
 switch (process.argv[2]) {
@@ -146,6 +208,15 @@ switch (process.argv[2]) {
   case 'verify':
     await verify(await seed())
     break
+  case 'operator': {
+    let input = ''
+    for await (const chunk of process.stdin) input += chunk
+    let credentials
+    try { credentials = JSON.parse(input) } catch { throw new Error('Invalid operator provisioning input.') }
+    await createOperator(credentials.email, credentials.password)
+    console.log('Local operator created.')
+    break
+  }
   default:
-    throw new Error('Usage: docker compose run --rm fixtures seed|verify')
+    throw new Error('Usage: docker compose run --rm fixtures seed|verify (operator provisioning: docker/create-operator.ps1)')
 }

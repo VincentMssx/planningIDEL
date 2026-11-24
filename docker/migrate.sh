@@ -15,4 +15,7 @@ for migration in /migrations/*.sql; do
   sed "s/\r\$//; /^commit;\$/i insert into idel_local_migrations.applied values ('$name');" "$migration" |
     psql -X -v ON_ERROR_STOP=1
 done
-psql -X -v ON_ERROR_STOP=1 -c "notify pgrst, 'reload schema'"
+psql -X -v ON_ERROR_STOP=1 \
+  -c "select vault.create_secret('mailpit','idel_email_transport') where not exists (select 1 from vault.secrets where name = 'idel_email_transport')" \
+  -c "select vault.create_secret('planning@example.test','idel_email_sender') where not exists (select 1 from vault.secrets where name = 'idel_email_sender')" \
+  -c "notify pgrst, 'reload schema'"

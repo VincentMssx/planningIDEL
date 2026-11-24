@@ -13,8 +13,12 @@ enable_signup = false
 enable_confirmations = false
 
 [auth.mfa.totp]
-enroll_enabled = true
-verify_enabled = true
+enroll_enabled = false
+verify_enabled = false
+
+[auth.hook.send_email]
+enabled = true
+uri = "pg-functions://postgres/public/idel_block_auth_email"
 
 [db.seed]
 enabled = false

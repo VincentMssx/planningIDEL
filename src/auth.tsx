@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
 import type { Session } from '@supabase/supabase-js'
 import { canReadPlanning, readAccount, type Client } from './data'
 import { Workspace } from './workspace'
+import { Admin } from './admin'
 
 function Panel({ title, children }: { title: string; children: ReactNode }) {
   return <main className="access"><p className="eyebrow">Planning IDEL · 2027</p><h1>{title}</h1>{children}</main>
@@ -38,7 +39,7 @@ function Login({ db }: { db: Client }) {
     finally { setBusy(false) }
   }
   return <Panel title="Espace privé des tournées">
-    <p>Janvier à juin 2027. Cet espace est réservé aux quatre membres du groupe.</p>
+    <p>Janvier à juin 2027. Connexion réservée aux membres et à l’administrateur.</p>
     <form onSubmit={submit}>
       <label>Adresse e-mail<input name="email" type="email" autoComplete="username" required /></label>
       <label>Mot de passe<input name="password" type="password" autoComplete="current-password" required /></label>
@@ -48,16 +49,14 @@ function Login({ db }: { db: Client }) {
   </Panel>
 }
 
-type Phase = 'loading' | 'denied' | 'password' | 'mfa' | 'ready' | 'unavailable'
-type Enrollment = { id: string; qr: string; secret: string }
+type Phase = 'loading' | 'denied' | 'password' | 'email' | 'ready' | 'admin' | 'unavailable'
 
 function Gate({ db, session }: { db: Client; session: Session }) {
   const [phase, setPhase] = useState<Phase>('loading')
   const [retry, setRetry] = useState(0)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [factor, setFactor] = useState<string>()
-  const [enrollment, setEnrollment] = useState<Enrollment>()
+  const [mailStatus, setMailStatus] = useState('')
   const [signedOut, setSignedOut] = useState(false)
   const gated = useRef(false)
   const id = session.user.id
@@ -69,25 +68,17 @@ function Gate({ db, session }: { db: Client; session: Session }) {
       try {
         const account = await readAccount(db)
         if (!current) return
-        if (!account.active) { gated.current = false; setEnrollment(undefined); setPhase('denied'); return }
-        if (account.must_change_password) { gated.current = false; setEnrollment(undefined); setPhase('password'); return }
-        const assurance = await db.auth.mfa.getAuthenticatorAssuranceLevel(token)
-        if (!current) return
-        if (assurance.error) throw assurance.error
-        if (assurance.data.currentLevel === 'aal2') {
-          const allowed = await canReadPlanning(db, id)
-          if (!current) return
-          gated.current = allowed
-          setEnrollment(undefined)
-          setPhase(allowed ? 'ready' : 'denied')
+        if (!account.active) { gated.current = false; setPhase('denied'); return }
+        if (account.must_change_password) { gated.current = false; setPhase('password'); return }
+        if (account.operator) {
+          gated.current = false
+          setPhase(account.verified ? 'admin' : 'email')
           return
         }
-        gated.current = false
-        const list = await db.auth.mfa.listFactors()
+        const allowed = await canReadPlanning(db, id)
         if (!current) return
-        if (list.error) throw list.error
-        setFactor(list.data.totp[0]?.id)
-        setPhase('mfa')
+        gated.current = allowed
+        setPhase(allowed ? 'ready' : 'email')
       } catch {
         if (current && !gated.current) setPhase('unavailable')
       }
@@ -98,13 +89,14 @@ function Gate({ db, session }: { db: Client; session: Session }) {
 
   function accessLost() {
     gated.current = false
+    setMailStatus('')
     setPhase('loading')
     setRetry((n) => n + 1)
   }
 
   async function signOut() {
     setSignedOut(true)
-    setEnrollment(undefined)
+    setMailStatus('')
     setError('')
     try {
       const result = await db.auth.signOut({ scope: 'local' })
@@ -137,44 +129,45 @@ function Gate({ db, session }: { db: Client; session: Session }) {
     }, 'Changement non confirmé. Si le nouveau mot de passe a été enregistré, utilisez « Vérifier le changement ».')
   }
 
-  function enroll() {
+  function sendCode() {
     void act(async () => {
-      const list = await db.auth.mfa.listFactors()
-      if (list.error) throw list.error
-      if (list.data.totp[0]) { setFactor(list.data.totp[0].id); return }
-      for (const old of list.data.all.filter((f) => f.factor_type === 'totp' && f.status === 'unverified')) {
-        const removed = await db.auth.mfa.unenroll({ factorId: old.id })
-        if (removed.error) throw removed.error
-      }
-      const result = await db.auth.mfa.enroll({ factorType: 'totp', friendlyName: 'Planning IDEL' })
+      const result = await db.rpc('request_email_code').retry(false)
       if (result.error) throw result.error
-      const { id, totp } = result.data
-      const prefix = 'data:image/svg+xml;utf-8,'
-      setEnrollment({ id, secret: totp.secret, qr: totp.qr_code.startsWith(prefix) ? `data:image/svg+xml,${encodeURIComponent(totp.qr_code.slice(prefix.length))}` : '' })
-    }, 'Préparation du code impossible. Réessayez.')
+      switch (result.data) {
+        case 'sent': setMailStatus('Code envoyé. Il est valable 10 minutes. Pensez à vérifier les indésirables.'); break
+        case 'wait': setError('Attendez une minute entre deux envois.'); break
+        case 'limit': setError('Limite d’envoi atteinte. Réessayez plus tard.'); break
+        case 'denied':
+        case 'verified': setRetry((n) => n + 1); break
+        default: throw new Error('Envoi indisponible')
+      }
+    }, 'Envoi non confirmé. Vérifiez votre boîte de réception avant de réessayer.')
   }
 
   function verify(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
     const form = e.currentTarget
     const code = String(new FormData(form).get('code')).trim()
-    const factorId = factor ?? enrollment?.id
-    if (!factorId) return
     void act(async () => {
-      const challenge = await db.auth.mfa.challenge({ factorId })
-      if (challenge.error) throw challenge.error
-      const verified = await db.auth.mfa.verify({ factorId, challengeId: challenge.data.id, code })
-      if (verified.error) throw verified.error
-      form.reset()
-      setRetry((n) => n + 1)
-    }, 'Code non confirmé. Vérifiez le code courant et l’heure du téléphone, puis réessayez.')
+      const result = await db.rpc('verify_email_code', { p_code: code }).retry(false)
+      if (result.error) throw result.error
+      switch (result.data) {
+        case 'denied':
+        case 'verified': form.reset(); setRetry((n) => n + 1); break
+        case 'invalid': setError('Code incorrect. Vérifiez les six chiffres reçus.'); break
+        case 'expired': setError('Code expiré ou absent pour cette session. Demandez un nouveau code.'); break
+        case 'limit': setError('Trop de tentatives. Demandez un nouveau code.'); break
+        default: throw new Error('Vérification indisponible')
+      }
+    }, 'Code non confirmé. Réessayez avec le dernier code reçu.')
   }
 
   if (signedOut) return <Panel title="Déconnexion"><p role="status">{error || 'Fermeture de la session…'}</p>{error && <button onClick={() => void signOut()}>Réessayer</button>}</Panel>
   if (phase === 'ready') return <Workspace db={db} id={id} token={token} signOut={() => void signOut()} accessLost={accessLost} />
-  return <Panel title={{ loading: 'Vérification de la session', denied: 'Accès indisponible', unavailable: 'Service inaccessible', password: 'Nouveau mot de passe', mfa: 'Code d’authentification' }[phase]}>
+  if (phase === 'admin') return <Admin db={db} token={token} signOut={() => void signOut()} accessLost={accessLost} />
+  return <Panel title={{ loading: 'Vérification de la session', denied: 'Accès indisponible', unavailable: 'Service inaccessible', password: 'Nouveau mot de passe', email: 'Code de connexion' }[phase]}>
     {phase === 'loading' && <p role="status">Vérification en cours…</p>}
-    {phase === 'denied' && <p>Cette session ne donne pas accès à l’espace privé. En cas de perte du téléphone ou d’accès désactivé, contactez la personne chargée des comptes hors de l’application.</p>}
+    {phase === 'denied' && <p>Cette session ne donne pas accès à l’espace privé. Si vous n’avez plus accès à votre boîte e-mail, contactez la personne chargée des comptes.</p>}
     {phase === 'unavailable' && <button onClick={() => setRetry((n) => n + 1)}>Vérifier à nouveau</button>}
     {phase === 'password' && <>
       <p>Remplacez le mot de passe temporaire par un mot de passe unique d’au moins 14 caractères.</p>
@@ -189,17 +182,14 @@ function Gate({ db, session }: { db: Client; session: Session }) {
         setRetry((n) => n + 1)
       }, 'Aucun changement confirmé. Remplacez d’abord le mot de passe temporaire.')}>Vérifier le changement</button>
     </>}
-    {phase === 'mfa' && <>
-      {!factor && !enrollment && <><p>Associez une application d’authentification sur votre téléphone.</p><button className="primary" disabled={busy} onClick={enroll}>Configurer le code TOTP</button></>}
-      {!factor && enrollment && <>
-        <p>Scannez le QR avec votre application d’authentification ou saisissez la clé manuellement si vous utilisez le même téléphone.</p>
-        {enrollment.qr && <img className="qr" src={enrollment.qr} alt="QR de configuration TOTP" />}
-        <p>Clé manuelle : <code className="secret">{enrollment.secret}</code></p>
-      </>}
-      {(factor || enrollment) && <form onSubmit={verify}>
+    {phase === 'email' && <>
+      <p>Recevez un code à usage unique sur l’adresse e-mail associée à votre compte.</p>
+      {mailStatus && <p role="status">{mailStatus}</p>}
+      <form onSubmit={verify}>
         <label>Code à six chiffres<input name="code" autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required /></label>
         <button className="primary" disabled={busy}>Vérifier le code</button>
-      </form>}
+      </form>
+      <button disabled={busy} onClick={sendCode}>{mailStatus ? 'Renvoyer un code' : 'Envoyer le code par e-mail'}</button>
     </>}
     {error && <p role="alert">{error}</p>}
     <button className="quiet" disabled={busy} onClick={() => void signOut()}>Déconnexion</button>

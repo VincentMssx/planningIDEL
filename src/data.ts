@@ -11,7 +11,7 @@ export function configuredClient() {
 }
 
 export type Client = NonNullable<ReturnType<typeof configuredClient>>
-export type AccountState = { active: boolean; must_change_password: boolean }
+export type AccountState = { active: boolean; must_change_password: boolean; operator?: boolean; verified?: boolean }
 
 export async function readAccount(db: Client) {
   const { data, error } = await db.rpc('account_state')

@@ -40,8 +40,10 @@ services:
       GOTRUE_JWT_AUD: authenticated
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_EXP: 3600
-      GOTRUE_MFA_TOTP_ENROLL_ENABLED: "true"
-      GOTRUE_MFA_TOTP_VERIFY_ENABLED: "true"
+      GOTRUE_MFA_TOTP_ENROLL_ENABLED: "false"
+      GOTRUE_MFA_TOTP_VERIFY_ENABLED: "false"
+      GOTRUE_HOOK_SEND_EMAIL_ENABLED: "true"
+      GOTRUE_HOOK_SEND_EMAIL_URI: pg-functions://postgres/public/idel_block_auth_email
     healthcheck:
       test: [CMD, wget, -q, --spider, http://127.0.0.1:9999/health]
       interval: 3s
@@ -61,6 +63,11 @@ services:
     volumes:
       - ./docker/migrate.sh:/local/migrate.sh:ro
       - ./supabase/migrations:/migrations:ro
+
+  mailpit:
+    image: axllent/mailpit:v1.27.0
+    ports:
+      - "127.0.0.1:8025:8025"
 
   rest:
     image: postgrest/postgrest:v14.18
@@ -103,6 +110,7 @@ services:
     profiles: [fixtures]
     depends_on:
       web: { condition: service_healthy }
+      mailpit: { condition: service_started }
     environment:
       IDEL_LOCAL_JWT_SECRET: *local-jwt
       IDEL_LOCAL_ANON_KEY: *local-anon
