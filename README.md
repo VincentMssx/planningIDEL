@@ -1,6 +1,6 @@
 # Planning IDEL
 
-Espace privé de coordination des quatre IDEL pour le planning de janvier à juin 2027. Les tournées correspondent à des créneaux et des affectations d'équipe, pas à des visites de patients. Aucun nom de patient, adresse de visite, acte, document ou autre donnée de santé ne doit être importé ou saisi. Le chat n'est pas disponible et les motifs de refus sont prédéfinis.
+Espace privé de coordination des quatre IDEL pour le planning de janvier à juin 2027. Les tournées correspondent à des créneaux et des affectations d'équipe, pas à des visites de patients. Le chat de démonstration est réservé à la coordination de l'équipe : aucune donnée patient, adresse de visite, information de soins ou document ne doit y être partagé, ni importé dans le planning. Les motifs de refus sont prédéfinis.
 
 ## Mise en service
 

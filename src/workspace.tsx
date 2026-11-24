@@ -1,16 +1,17 @@
-import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
-  assigned, canReadPlanning, readAccount, readHistory, readSnapshot, todayInParis, defaultMonth, dayKey,
-  dayLabel, shortDayLabel, timeLabel, effectiveStatus, isRefusalReason, slot, FIRST_DAY, LAST_DAY, MONTHS, PEOPLE, REFUSAL_REASONS, STATUS,
-  type Audit, type Client, type HistoryFilter, type RefusalReason, type Snapshot, type Tour,
+  assigned, canReadPlanning, readAccount, readHistory, readMessages, readSnapshot, todayInParis, defaultMonth, dayKey,
+  dayLabel, shortDayLabel, timeLabel, effectiveStatus, isRefusalReason, slot, FIRST_DAY, LAST_DAY, MONTHS, PARIS, PEOPLE, REFUSAL_REASONS, STATUS,
+  type Audit, type Client, type HistoryFilter, type Message, type RefusalReason, type Snapshot, type Tour,
 } from './data'
 
 type Props = { db: Client; id: string; token: string; signOut: () => void; accessLost: () => void }
-type Feed = Awaited<ReturnType<typeof readHistory>>
-type View = 'calendar' | 'audit'
+type Feed<Row> = { rows: Row[]; more: boolean }
+type View = 'calendar' | 'audit' | 'messages'
 const tabs = [
   { view: 'calendar', label: 'Planning', icon: 'M3 6h18v15H3z M3 10h18 M7 3v5 M17 3v5' },
   { view: 'audit', label: 'Historique', icon: 'M4 11a8 8 0 1 1 2 7 M4 5v6h6 M12 8v5l3 2' },
+  { view: 'messages', label: 'Chat', icon: 'M3 4h18v12H9l-6 4z M7 9h10 M7 12h6' },
 ] as const
 const tours = [0, 1, 2] as const
 const hideRefresh = import.meta.env.DEV || import.meta.env.VITE_HIDE_PLANNING_REFRESH === 'true'
@@ -18,7 +19,8 @@ export type WorkspaceSource = {
   today: () => string
   allowed: () => Promise<boolean>
   snapshot: (day: string | null) => Promise<Snapshot>
-  history: (day: string, cursor?: Audit, history?: HistoryFilter) => Promise<Feed>
+  history: (day: string, cursor?: Audit, history?: HistoryFilter) => Promise<Feed<Audit>>
+  messages: (cursor?: Message) => Promise<Feed<Message>>
   mutate: (name: string, args: Record<string, unknown>, signal: AbortSignal) => PromiseLike<{ status: number; error: { code: string; message: string } | null }>
 }
 const weekday = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim']
@@ -37,6 +39,7 @@ export function Workspace({ db, id, token, signOut, accessLost }: Props) {
     },
     snapshot: (day) => readSnapshot(db, day),
     history: (day, cursor, history) => readHistory(db, day, cursor, history),
+    messages: (cursor) => readMessages(db, cursor),
     mutate: (name, args, signal) => db.rpc(name, args).retry(false).abortSignal(signal),
   }
   return <WorkspaceView {...{ source, id, token, signOut, accessLost }} />
@@ -57,7 +60,9 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all')
   const historyKey = `${historyFilter}/${filter}`
   const [snapshot, setSnapshot] = useState<Snapshot>()
-  const [historyFeed, setHistoryFeed] = useState<{ page: Feed; filter: string }>()
+  const [historyFeed, setHistoryFeed] = useState<{ page: Feed<Audit>; filter: string }>()
+  const [messageFeed, setMessageFeed] = useState<Feed<Message>>()
+  const [draft, setDraft] = useState('')
   const [stale, setStale] = useState(false)
   const [refreshing, setRefreshing] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -92,15 +97,18 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
         return
       }
       if (request !== serial.current) return
-      const [planning, audit] = await Promise.all([
+      const [planning, audit, messages] = await Promise.all([
         source.snapshot(selectedDay),
         view === 'audit' ? source.history(filter, undefined, historyFilter) : undefined,
+        view === 'messages' ? source.messages() : undefined,
       ])
       if (request !== serial.current) return
       // RLS can silently return empty rows if authorization changed during the reads.
       if (!planning.members.some((m) => m.id === id && m.active)) { accessLost(); return }
       setSnapshot(planning)
-      if (audit) setHistoryFeed((old) => ({ filter: historyKey, page: refreshFeed(old?.filter === historyKey ? old.page : undefined, audit) }))
+      // A newly closed ticket can move from an older history page to the first page.
+      if (audit) setHistoryFeed((old) => ({ filter: historyKey, page: refreshFeed(old?.filter === historyKey ? old.page : undefined, audit, (row) => row.proposal_id ?? row.id) }))
+      if (messages) setMessageFeed((old) => refreshFeed(old, messages))
       setStale(false)
       setUnconfirmed(false)
     } catch (error) {
@@ -125,6 +133,15 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
     }
   }, [])
 
+  const pollMessages = useEffectEvent(() => {
+    if (view === 'messages' && document.visibilityState === 'visible' && !sending.current && !refreshing && !paging) void refresh()
+  })
+  useEffect(() => {
+    if (view !== 'messages') return
+    const timer = window.setInterval(() => pollMessages(), 30_000)
+    return () => window.clearInterval(timer)
+  }, [view])
+
   function jumpMonth(index: number) {
     const container = scroll.current
     const section = container?.querySelector(`[data-month="${index}"]`)
@@ -136,7 +153,7 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
   const calendarVisible = !!snapshot && view === 'calendar'
   useEffect(() => { if (calendarVisible) restoreMonth() }, [calendarVisible])
 
-  const sheetVisible = !!snapshot && (voting || day !== null)
+  const sheetVisible = !!snapshot && (voting || (day !== null && (view !== 'messages' || ticket !== null)))
   useLayoutEffect(() => {
     if (sheetVisible && !sheet.current?.open) sheet.current?.showModal()
   }, [sheetVisible])
@@ -180,14 +197,14 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
     }
   }
 
-  async function more(feed: Feed) {
+  async function more<Row>(feed: Feed<Row>, read: (cursor?: Row) => Promise<Feed<Row>>, save: (page: Feed<Row>) => void) {
     if (paging || refreshing || stale) return
     const request = serial.current
     setPaging(true)
     try {
-      const next = await source.history(filter, feed.rows.at(-1), historyFilter)
+      const next = await read(feed.rows.at(-1))
       if (request !== serial.current) return
-      setHistoryFeed({ filter: historyKey, page: { ...next, rows: [...feed.rows, ...next.rows] } })
+      save({ ...next, rows: [...feed.rows, ...next.rows] })
     } catch {
       if (request === serial.current) { setNotice('Impossible de lire la page suivante.'); await refresh() }
     } finally { if (request === serial.current) setPaging(false) }
@@ -220,6 +237,11 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
     })
   }
 
+  function send() {
+    const body = draft.trim()
+    if (!locked && body) void mutate('post_message', { p_body: body }, () => setDraft(''))
+  }
+
   return <main className="idel-app">
     {controls}
     <header className="topbar">
@@ -233,7 +255,7 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
     {stale && <p className="notice" role="alert">{snapshot ? 'Données non actualisées : dernière lecture disponible.' : 'Lecture indisponible.'} Vérifiez la connexion, puis {hideRefresh ? 'rechargez la page' : 'actualisez'}.</p>}
     {notice && !sheetVisible && <p className="notice" role="status">{notice}</p>}
     {!snapshot && !stale && <p role="status">Lecture de l’espace privé…</p>}
-    {nextVote && <button className="vote-callout" disabled={busy} onClick={() => {
+    {nextVote && view !== 'messages' && <button className="vote-callout" disabled={busy} onClick={() => {
       if (view === 'calendar') jumpMonth(Number(nextVote.expires_on.slice(5, 7)) - 1)
       setDay(null)
       setTicket(null)
@@ -361,9 +383,13 @@ export function WorkspaceView({ source, id, token, signOut, accessLost, controls
         {!history?.rows.length && <p className="pane-empty" role="status">{refreshing ? 'Lecture en cours…' : 'Aucune décision'}</p>}
         <ol className="history-list">{history?.rows.map((row) => <AuditEntry key={row.id} row={row} person={person} day={filter} openDay={openDay}
           pending={!!row.proposal_id && open.has(row.proposal_id)} needsVote={!!row.proposal_id && toVote.has(row.proposal_id)} />)}</ol>
-        {history?.more && <button className="load-more" disabled={paging || refreshing || stale} onClick={() => void more(history)}>Afficher les éléments précédents</button>}
+        {history?.more && <button className="load-more" disabled={paging || refreshing || stale} onClick={() => void more(history,
+          (cursor) => source.history(filter, cursor, historyFilter), (page) => setHistoryFeed({ filter: historyKey, page }))}>Afficher les éléments précédents</button>}
       </div>
     </section>}
+    {snapshot && view === 'messages' && <ChatPane id={id} today={today} person={person} feed={messageFeed} draft={draft} setDraft={setDraft} send={send} openTicket={openDay}
+      demo={!!controls} busy={busy} locked={locked} refreshing={refreshing} stale={stale} canPage={!busy && !paging && !refreshing && !stale}
+      loadOlder={() => { if (messageFeed) void more(messageFeed, source.messages, setMessageFeed) }} />}
     <nav className="bottom-nav" aria-label="Espace de travail">
       {tabs.map((tab) => <button key={tab.view}
         aria-current={view === tab.view ? 'page' : undefined} disabled={busy} onClick={() => { setDay(null); if (tab.view === 'audit') setFilter(''); setView(tab.view) }}>
@@ -387,7 +413,7 @@ function RefusalForm({ locked, submit, cancel }: { locked: boolean; submit: (rea
       <option value="" disabled>Choisir un motif…</option>
       {Object.entries(REFUSAL_REASONS).map(([code, label]) => <option key={code} value={code}>{label}</option>)}
     </select></label>
-    <p id="refusal-hint" className="note">Le motif sera visible par les membres dans l’historique.</p>
+    <p id="refusal-hint" className="note">Le motif sera visible par les membres dans l’historique et le chat du groupe.</p>
     <div className="proposal-actions"><button type="button" onClick={cancel}>Annuler</button><button className="reject" disabled={locked || !isRefusalReason(reason)}>Confirmer le refus</button></div>
   </form>
 }
@@ -513,12 +539,91 @@ function AuditEntry({ row, person, day, openDay, pending, needsVote }: { row: Au
   return <li>{date && date >= FIRST_DAY && date <= LAST_DAY ? <button className={className} onClick={() => openDay(date, row.proposal_id ?? undefined)}>{content}</button> : <div className={className}>{content}</div>}</li>
 }
 
-function refreshFeed(previous: Feed | undefined, latest: Feed) {
+function refreshFeed<Row extends { id: string }>(previous: Feed<Row> | undefined, latest: Feed<Row>, key: (row: Row) => string = (row) => row.id) {
   const oldest = latest.rows.at(-1)
   const overlap = oldest ? previous?.rows.findIndex((row) => row.id === oldest.id) ?? -1 : -1
   if (!previous || !latest.more || overlap < 0) return latest
-  // A newly closed ticket can move from an older history page to the first page.
-  const key = (row: Audit) => row.proposal_id ?? row.id
   const seen = new Set(latest.rows.map(key))
   return { rows: [...latest.rows, ...previous.rows.slice(overlap + 1).filter((row) => !seen.has(key(row)))], more: previous.more }
+}
+
+const chatTime = new Intl.DateTimeFormat('fr-FR', { timeStyle: 'short', timeZone: PARIS })
+
+function ChatPane({ id, today, person, feed, draft, setDraft, send, demo, busy, locked, refreshing, stale, canPage, loadOlder, openTicket }: {
+  id: string; today: string; person: PersonLabel; feed?: Feed<Message>; draft: string; setDraft: (draft: string) => void;
+  send: () => void; demo: boolean; busy: boolean; locked: boolean; refreshing: boolean; stale: boolean; canPage: boolean; loadOlder: () => void;
+  openTicket: (day: string, proposalId: string) => void;
+}) {
+  const box = useRef<HTMLDivElement>(null)
+  const atBottom = useRef(true)
+  const older = useRef<{ first: string; height: number; top: number } | undefined>(undefined)
+  const rows = feed?.rows.slice().reverse() ?? []
+  const first = rows[0]?.id
+  const last = rows.at(-1)?.id
+  useLayoutEffect(() => {
+    const element = box.current
+    if (!element) return
+    if (older.current && older.current.first !== first) {
+      const { height, top } = older.current
+      older.current = undefined
+      element.scrollTop = top + element.scrollHeight - height
+    } else {
+      if (canPage) older.current = undefined
+      if (atBottom.current) element.scrollTop = element.scrollHeight
+    }
+  }, [first, last, canPage])
+
+  function showOlder() {
+    const element = box.current
+    if (element && first) older.current = { first, height: element.scrollHeight, top: element.scrollTop }
+    loadOlder()
+  }
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (locked || !draft.trim()) return
+    older.current = undefined
+    atBottom.current = true
+    send()
+  }
+
+  return <section className="chat-view" aria-labelledby="chat-heading">
+    <header className="chat-group-header">
+      <h2 id="chat-heading">Chat Groupe</h2>
+      <ul role="list" aria-label="Participantes du groupe">
+        {PEOPLE.map(({ name, color }) => <li key={name} className={`nurse-chip ${color}`}>{name}</li>)}
+      </ul>
+      <p id="chat-privacy" className="note">{demo ? 'Démo : ne partagez aucune donnée patient.' : 'Ne partagez aucune donnée patient.'}</p>
+    </header>
+    <div className="chat-scroll" ref={box} role="region" aria-label="Fil de discussion" tabIndex={0}
+      onScroll={({ currentTarget: e }) => { atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40 }}>
+      {feed?.more && <button className="load-more" disabled={!canPage} onClick={showOlder}>Messages précédents</button>}
+      {!rows.length && <p className="pane-empty" role="status">{refreshing ? 'Lecture en cours…' : stale && !feed ? 'Lecture des messages indisponible.' : 'Aucun message'}</p>}
+      <div role="log" aria-label="Messages du groupe">
+        <ol className="chat-messages" role="list">{rows.map((row, index) => {
+          const date = todayInParis(new Date(row.created_at))
+          const previous = rows[index - 1]
+          const mine = row.member_id === id
+          const name = person(row.member_id)
+          const nurse = PEOPLE.find((p) => p.name === name)
+          const { proposal_day: day, proposal_id: proposalId } = row
+          return <Fragment key={row.id}>
+            {(!previous || todayInParis(new Date(previous.created_at)) !== date) && <li className="chat-day">{date === today ? 'Aujourd’hui' : dayLabel(date)}</li>}
+            <li className={`msg-row${mine ? ' mine' : ''}`}>
+              {!mine && <span className={`msg-avatar ${nurse?.color ?? 'unassigned'}`} aria-hidden="true">{nurse?.code ?? '–'}</span>}
+              <div className="msg-bubble">
+                <p className="msg-top"><strong className={mine ? 'sr-only' : undefined}>{mine ? 'Vous' : name}</strong><time dateTime={row.created_at}>{chatTime.format(new Date(row.created_at))}</time></p>
+                <p className="message">{row.body}</p>
+                {day && proposalId && <button className="chat-ticket-link" disabled={busy} onClick={() => openTicket(day, proposalId)}>Voir la modification <span aria-hidden="true">↗</span></button>}
+              </div>
+            </li>
+          </Fragment>
+        })}</ol>
+      </div>
+    </div>
+    <form className="chat-compose" onSubmit={submit}>
+      <input aria-label="Message" aria-describedby="chat-privacy" placeholder="Écrire un message…" maxLength={2000} required value={draft} readOnly={busy} onChange={(e) => setDraft(e.target.value)} autoComplete="off" />
+      <button className="primary icon-button" type="submit" aria-label="Envoyer" disabled={locked || !draft.trim()}><Icon path="M12 20V4 M5 11l7-7 7 7" /></button>
+    </form>
+  </section>
 }

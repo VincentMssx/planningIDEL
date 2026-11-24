@@ -37,6 +37,8 @@ async function expectDenied(path, options) {
 }
 const denied = (name, token, body = {}) => expectDenied(rpcPath(name), { method: 'POST', token, body })
 const official = (token) => get('rest/v1/assignments?order=day,tour', { token })
+const chat = (token) => get('rest/v1/messages?select=id,member_id,body,proposal_id,proposal_day', { token })
+const post = (token, p_body) => rpc('post_message', token, { p_body })
 const adminUsers = 'auth/v1/admin/users'
 
 async function createOperator(address, passphrase) {
@@ -127,6 +129,8 @@ async function verify(rows) {
     const token = session.access_token
     assert.deepEqual(await rpc('account_state', token), { active: true, must_change_password: true })
     assert.deepEqual(await official(token), [])
+    assert.deepEqual(await chat(token), [])
+    await denied('post_message', token, { p_body: 'Local fixture' })
     for (const [name, body] of [['request_email_code', {}], ['verify_email_code', { p_code: '000000' }]]) {
       assert.equal((await request(rpcPath(name), { method: 'POST', token, body })).status, 404)
     }
@@ -207,10 +211,16 @@ async function verify(rows) {
     assert.deepEqual(await votes(draft), [])
     assert.equal(await rpc('withdraw_proposal', token, { p_proposal_id: draft }), 'withdrawn')
   }
-  const removedPost = await request(rpcPath('post_message'), { method: 'POST', token: alice, body: { p_body: 'Local fixture' } })
-  assert.equal(removedPost.status, 404)
-  assert.equal(removedPost.data?.code, 'PGRST202')
-  for (const reason of ['unavailable', 'schedule_conflict', 'keep_schedule']) {
+  await expectDenied('rest/v1/messages', { token: anon })
+  await denied('post_message', anon, { p_body: 'Local fixture' })
+  await expectDenied('rest/v1/messages', { method: 'POST', token: alice, body: { member_id: users[1], body: 'Local fixture' } })
+  for (const p_body of ['', ' \t\n ', 'a'.repeat(2001)]) {
+    const invalid = await request(rpcPath('post_message'), { method: 'POST', token: alice, body: { p_body } })
+    assert.equal(invalid.data?.code, '22023')
+  }
+  const messageId = await post(alice, '  Local fixture  ')
+  assert.deepEqual(await chat(bob), [{ id: messageId, member_id: users[0], body: 'Local fixture', proposal_id: null, proposal_day: null }])
+  for (const [reason, label] of Object.entries({ unavailable: 'Indisponible', schedule_conflict: 'Conflit de planning', keep_schedule: 'Conserver le planning actuel' })) {
     const refused = await rpc('create_proposal', alice, { ...create, p_day: second.day, p_other_day: first.day })
     const reject = { p_proposal_id: refused, p_approve: false }
     if (reason === 'unavailable') {
@@ -240,13 +250,20 @@ async function verify(rows) {
     assert.equal(refusalAudit[0].details.reason_code, reason)
     assert.equal(Object.hasOwn(refusalAudit[0].details, 'reason'), false)
     assert.equal(refusalAudit[0].details.lines.length, 2)
+    const linked = (await chat(bob)).filter((message) => message.proposal_id === refused)
+    assert.equal(linked.length, 1)
+    assert.equal(linked[0].proposal_day, first.day)
+    assert.equal(linked[0].member_id, users[0])
+    assert.ok(linked[0].body.endsWith(`\nMotif : ${label}`))
   }
-  for (const token of [bob, admin]) await expectDenied('rest/v1/messages', { token })
+  await expectDenied('rest/v1/messages', { token: admin })
 
   const tested = users[0]
   const setActive = (active) => get(`rest/v1/members?id=eq.${tested}`, { method: 'PATCH', token: admin, body: { active } })
   await setActive(false)
   assert.deepEqual(await official(alice), [])
+  assert.deepEqual(await chat(alice), [])
+  await denied('post_message', alice, { p_body: 'Local fixture' })
   await get('auth/v1/logout?scope=global', { method: 'POST', token: alice })
   await get(`${adminUsers}/${tested}`, { method: 'PUT', token: admin, body: { password } })
   await rpc('require_password_change', admin, { p_member_id: tested })
@@ -297,7 +314,8 @@ async function verify(rows) {
   await denied('admin_overview', passwordOnly)
   assert.deepEqual(await official(operator), [])
   await denied('create_proposal', operator, replace)
-  await expectDenied('rest/v1/messages', { token: operator })
+  assert.deepEqual(await chat(operator), [])
+  await denied('post_message', operator, { p_body: 'Local fixture' })
   const overview = await rpc('admin_overview', operator)
   assert.equal(overview.members.length, 4)
   const fannyId = overview.members.find((member) => member.name === 'Fanny').id
@@ -306,7 +324,7 @@ async function verify(rows) {
     assert.deepEqual(await official(fanny), [])
   }
   assert.deepEqual((await rpc('admin_overview', operator)).history.map((entry) => [entry.name, entry.active]), [['Fanny', true], ['Fanny', false]])
-  console.log('Verified: member password login, retired OTP, contacts and messages APIs, participant votes with refusal codes, account recovery, and isolated audited operator access with approved TOTP.')
+  console.log('Verified: member password login, restricted group chat, participant votes with refusal notices, account recovery, and isolated audited operator access with approved TOTP.')
 }
 
 switch (process.argv[2]) {

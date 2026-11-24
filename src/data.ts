@@ -50,6 +50,7 @@ export type AuditDetails = Record<string, unknown> & {
   proposal_created_at?: string | null
 }
 export type Audit = { id: string; kind: string; actor_id: string | null; proposal_id: string | null; days: string[]; details: AuditDetails; created_at: string }
+export type Message = { id: string; member_id: string; body: string; created_at: string; proposal_id: string | null; proposal_day: string | null }
 export type Snapshot = { members: Member[]; assignments: Assignment[]; proposals: Proposal[]; lines: Line[]; votes: Vote[] }
 
 export const FIRST_DAY = '2027-01-01'
@@ -142,5 +143,14 @@ export async function readHistory(db: Client, day: string, cursor?: Audit, histo
   const { data, error } = await query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(PAGE_SIZE + 1)
   if (error) throw error
   const rows = data as Audit[]
+  return { rows: rows.slice(0, PAGE_SIZE), more: rows.length > PAGE_SIZE }
+}
+
+export async function readMessages(db: Client, cursor?: Message) {
+  let query = db.from('messages').select('id,member_id,body,created_at,proposal_id,proposal_day')
+  if (cursor) query = query.or(`created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`)
+  const { data, error } = await query.order('created_at', { ascending: false }).order('id', { ascending: false }).limit(PAGE_SIZE + 1)
+  if (error) throw error
+  const rows = data as Message[]
   return { rows: rows.slice(0, PAGE_SIZE), more: rows.length > PAGE_SIZE }
 }

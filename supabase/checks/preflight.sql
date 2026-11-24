@@ -18,12 +18,13 @@ select * from (values
   ('TOTP pairing restricted to the project owner or service role',
     not has_function_privilege('authenticated','public.approve_operator_totp(uuid,uuid)','EXECUTE')
     and not has_function_privilege('anon','public.approve_operator_totp(uuid,uuid)','EXECUTE')),
-  ('Chat API unavailable', to_regprocedure('public.post_message(text)') is null
-    and not has_table_privilege('authenticated','public.messages','SELECT')
-    and not has_table_privilege('anon','public.messages','SELECT')),
-  ('No legacy free text stored in this hosted project', not exists (select 1 from public.messages)
-    and not exists (select 1 from idel_private.retired_audit_reasons)
-    and not exists (select 1 from public.audit where details ? 'reason')),
+  ('Chat requires authenticated team access', has_function_privilege('authenticated','public.post_message(text)','EXECUTE')
+    and not has_function_privilege('anon','public.post_message(text)','EXECUTE')
+    and has_table_privilege('authenticated','public.messages','SELECT')
+    and not has_table_privilege('anon','public.messages','SELECT')
+    and exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'messages' and policyname = 'active_team_chat')),
+  ('Refusal history has no free-text reason', not exists (select 1 from public.audit where details ? 'reason')
+    and not has_table_privilege('authenticated','idel_private.retired_audit_reasons','SELECT')),
   ('HTTP and pgcrypto installed in extensions', (select count(*) = 2 from pg_extension
     where extname in ('http','pgcrypto') and extnamespace = 'extensions'::regnamespace)),
   ('Email challenge RPCs retired', to_regprocedure('public.request_email_code()') is null
